@@ -1,0 +1,377 @@
+"""
+Third-person Panda3D renderer for CarNavEnv.
+
+This module is *only* imported when images are actually wanted -- the simulation
+core never touches it, so headless training never loads a graphics stack.
+
+Two design constraints drove the implementation:
+
+1. `build_scene` runs on every episode reset, because the map is resampled.
+   Creating a node per building tile and letting Panda flatten them takes
+   hundreds of milliseconds, which would dominate reset cost. Instead the whole
+   city is emitted as a *single* mesh: face visibility, vertices and normals are
+   computed with numpy and the vertex buffer is handed to Panda as raw bytes.
+   Interior faces between adjacent buildings are culled at build time.
+
+2. `capture` is a pure function of the environment state -- no camera smoothing,
+   no frame-to-frame carry-over. A smoothed chase camera looks nicer to a human
+   but makes the image observation depend on history, which silently breaks both
+   determinism under a fixed seed and the Markov property the vector state is
+   careful to preserve. Smoothing is available but defaults off; turn it on for
+   watching, not for training.
+"""
+
+import numpy as np
+from panda3d.core import loadPrcFileData
+
+# Must be configured before ShowBase is constructed.
+loadPrcFileData("", "audio-library-name null")   # no sound device, faster startup
+loadPrcFileData("", "sync-video 0")              # never block on vsync
+loadPrcFileData("", "notify-level-display error")
+
+from panda3d.core import (  # noqa: E402
+    AmbientLight, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
+    GeomVertexArrayFormat, GeomVertexData, GeomVertexFormat, GraphicsOutput,
+    InternalName, LineSegs, NodePath, Texture, Vec3, Vec4,
+)
+
+# position + normal + rgba, all float32 -- matches VERTEX_DTYPE below byte for byte.
+_afmt = GeomVertexArrayFormat()
+_afmt.addColumn(InternalName.getVertex(), 3, Geom.NTFloat32, Geom.CPoint)
+_afmt.addColumn(InternalName.getNormal(), 3, Geom.NTFloat32, Geom.CNormal)
+_afmt.addColumn(InternalName.getColor(), 4, Geom.NTFloat32, Geom.CColor)
+VERTEX_FORMAT = GeomVertexFormat.registerFormat(GeomVertexFormat(_afmt))
+
+VERTEX_DTYPE = np.dtype([("v", "<f4", 3), ("n", "<f4", 3), ("c", "<f4", 4)])
+
+# A quad's four corners expand to two triangles in this order.
+_QUAD_TO_TRIS = np.array([0, 1, 2, 0, 2, 3])
+
+SKY = (0.53, 0.62, 0.74)
+
+_BASE = None        # ShowBase is a process-wide singleton in Panda3D.
+
+
+def _get_base(size, offscreen):
+    """Create (or reuse) the single ShowBase instance for this process."""
+    global _BASE
+    if _BASE is None:
+        loadPrcFileData("", f"window-type {'offscreen' if offscreen else 'onscreen'}")
+        loadPrcFileData("", f"win-size {size[0]} {size[1]}")
+        from direct.showbase.ShowBase import ShowBase
+        _BASE = ShowBase()
+        _BASE.disableMouse()
+        _BASE.setBackgroundColor(*SKY)
+    return _BASE
+
+
+def _hash01(a, b):
+    """Deterministic pseudo-random floats in [0, 1) from two integer arrays.
+
+    Used for building heights and shades. Keyed on tile coordinates rather than
+    an RNG so a given tile looks the same every time it appears, which makes
+    successive procedural maps feel like one consistent city.
+    """
+    h = np.sin(a * 12.9898 + b * 78.233) * 43758.5453
+    return h - np.floor(h)
+
+
+def _quads_to_mesh(corners, normals, colors):
+    """Turn (N, 4, 3) quad corners into an (N*6,) structured vertex array."""
+    n_quads = corners.shape[0]
+    if n_quads == 0:
+        return np.zeros(0, dtype=VERTEX_DTYPE)
+    tris = corners[:, _QUAD_TO_TRIS, :].reshape(-1, 3)
+    out = np.zeros(len(tris), dtype=VERTEX_DTYPE)
+    out["v"] = tris
+    out["n"] = np.repeat(normals, 6, axis=0)
+    out["c"] = np.repeat(colors, 6, axis=0)
+    return out
+
+
+def _mesh_to_node(name, verts):
+    """Wrap a structured vertex array in a Panda GeomNode via a raw byte copy."""
+    vdata = GeomVertexData(name, VERTEX_FORMAT, Geom.UHStatic)
+    vdata.setNumRows(len(verts))
+    vdata.modifyArray(0).modifyHandle().setData(verts.tobytes())
+
+    prim = GeomTriangles(Geom.UHStatic)
+    prim.setIndexType(Geom.NTUint32)
+    prim.addConsecutiveVertices(0, len(verts))
+    prim.closePrimitive()
+
+    geom = Geom(vdata)
+    geom.addPrimitive(prim)
+    node = GeomNode(name)
+    node.addGeom(geom)
+    return NodePath(node)
+
+
+def _box_mesh(lo, hi, color, top_color=None):
+    """Axis-aligned box as 6 outward-facing quads. lo/hi are (x, y, z) tuples."""
+    x0, y0, z0 = lo
+    x1, y1, z1 = hi
+    faces = [
+        # (corners, normal)
+        ([(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)], (0, 0, 1)),
+        ([(x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0)], (0, 0, -1)),
+        ([(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)], (0, -1, 0)),
+        ([(x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)], (0, 1, 0)),
+        ([(x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)], (-1, 0, 0)),
+        ([(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)], (1, 0, 0)),
+    ]
+    corners = np.array([f[0] for f in faces], dtype=np.float32)
+    normals = np.array([f[1] for f in faces], dtype=np.float32)
+    cols = np.tile(np.asarray(color, dtype=np.float32), (6, 1))
+    if top_color is not None:
+        cols[0] = top_color
+    return _quads_to_mesh(corners, normals, cols)
+
+
+class PandaRenderer:
+    """Renders CarNavEnv from a chase camera to an RGB array or a window."""
+
+    def __init__(self, offscreen=True, size=64, fov=60.0,
+                 cam_dist=13.0, cam_height=6.5, look_ahead=9.0, smooth=0.0,
+                 build_min=6.0, build_max=24.0, show_rays=False):
+        self.size = (size, size) if isinstance(size, int) else tuple(size)
+        self.offscreen = offscreen
+        self.cam_dist = cam_dist
+        self.cam_height = cam_height
+        self.look_ahead = look_ahead
+        self.smooth = smooth          # 0 = stateless (required for training)
+        self.show_rays = show_rays    # LIDAR overlay; debug/visualisation only
+        self.build_min = build_min
+        self.build_max = build_max
+
+        self.base = _get_base(self.size, offscreen)
+        self.base.camLens.setFov(fov)
+        self.base.camLens.setNear(0.3)
+        self.base.camLens.setFar(400.0)
+
+        self._city_np = None
+        self._rays_np = None
+        self._cam_pos = None          # only used when smooth > 0
+        self._setup_lights()
+        self._setup_actors()
+
+        self._tex = None
+        if offscreen:
+            self._tex = Texture()
+            self.base.win.addRenderTexture(
+                self._tex, GraphicsOutput.RTMCopyRam, GraphicsOutput.RTPColor)
+
+    # ------------------------------------------------------------------
+    def _setup_lights(self):
+        render = self.base.render
+        amb = AmbientLight("amb")
+        amb.setColor(Vec4(0.45, 0.47, 0.52, 1))
+        render.setLight(render.attachNewNode(amb))
+
+        sun = DirectionalLight("sun")
+        sun.setColor(Vec4(0.85, 0.82, 0.75, 1))
+        sun_np = render.attachNewNode(sun)
+        sun_np.setHpr(-35, -55, 0)
+        render.setLight(sun_np)
+
+        # Hides the map boundary and gives the flat grid some depth cueing.
+        fog = Fog("fog")
+        fog.setColor(*SKY)
+        fog.setExpDensity(0.0055)
+        render.setFog(fog)
+
+    def _setup_actors(self):
+        """Build the car and target markers once; they are only repositioned."""
+        # Car geometry points along +x, matching heading 0 in the simulation.
+        body = _box_mesh((-2.2, -0.95, 0.25), (2.2, 0.95, 1.0), (0.80, 0.16, 0.13, 1))
+        cabin = _box_mesh((-1.1, -0.80, 1.0), (0.9, 0.80, 1.55), (0.12, 0.14, 0.18, 1))
+        self.car_np = self.base.render.attachNewNode("car")
+        _mesh_to_node("body", body).reparentTo(self.car_np)
+        _mesh_to_node("cabin", cabin).reparentTo(self.car_np)
+
+        # A tall thin post is visible over buildings and from any bearing, which
+        # matters because the marker has to be findable, not just pretty.
+        self.target_nps = []
+        for i in range(8):
+            post = _mesh_to_node(
+                f"target{i}",
+                _box_mesh((-0.6, -0.6, 0.0), (0.6, 0.6, 11.0), (0.15, 0.95, 0.35, 1)))
+            post.reparentTo(self.base.render)
+            post.setLightOff()          # emissive-looking, reads as a beacon
+            post.hide()
+            self.target_nps.append(post)
+
+    # ------------------------------------------------------------------
+    def build_scene(self, city):
+        """(Re)build the city mesh. Called on every reset, so it must be quick."""
+        if self._city_np is not None:
+            self._city_np.removeNode()
+
+        ts = city.tile_size
+        grid = city.grid
+        solid = grid == 1
+        rows, cols = np.nonzero(solid)
+
+        # Out-of-bounds neighbours count as solid: the outward faces of the
+        # boundary wall can never be seen from inside the city, so skip them.
+        def neighbour_solid(dr, dc):
+            r, c = rows + dr, cols + dc
+            inside = (r >= 0) & (r < city.height) & (c >= 0) & (c < city.width)
+            out = np.ones(len(rows), dtype=bool)
+            out[inside] = solid[r[inside], c[inside]]
+            return out
+
+        rnd = _hash01(rows, cols)
+        hgt = (self.build_min + (self.build_max - self.build_min) * rnd).astype(np.float32)
+        x0 = (cols * ts).astype(np.float32)
+        y0 = (rows * ts).astype(np.float32)
+        x1, y1 = x0 + ts, y0 + ts
+        z0 = np.zeros(len(rows), dtype=np.float32)
+
+        shade = (0.42 + 0.30 * _hash01(cols, rows)).astype(np.float32)
+        base_col = np.stack([shade * 0.98, shade * 0.95, shade * 0.90,
+                             np.ones_like(shade)], axis=1)
+
+        def quad(pts, normal, cols_rgba, mask):
+            corners = np.stack([np.stack(p, axis=1) for p in pts], axis=1)[mask]
+            normals = np.tile(np.asarray(normal, dtype=np.float32), (mask.sum(), 1))
+            return _quads_to_mesh(corners, normals, cols_rgba[mask])
+
+        allv = np.ones(len(rows), dtype=bool)
+        # Roofs get a flat lighter tone so blocks read as distinct volumes.
+        roof_col = np.clip(base_col * 1.18, 0, 1)
+        roof_col[:, 3] = 1.0
+
+        parts = [
+            quad([(x0, y0, hgt), (x1, y0, hgt), (x1, y1, hgt), (x0, y1, hgt)],
+                 (0, 0, 1), roof_col, allv),
+            quad([(x0, y0, z0), (x1, y0, z0), (x1, y0, hgt), (x0, y0, hgt)],
+                 (0, -1, 0), base_col, ~neighbour_solid(-1, 0)),
+            quad([(x1, y1, z0), (x0, y1, z0), (x0, y1, hgt), (x1, y1, hgt)],
+                 (0, 1, 0), base_col, ~neighbour_solid(1, 0)),
+            quad([(x0, y1, z0), (x0, y0, z0), (x0, y0, hgt), (x0, y1, hgt)],
+                 (-1, 0, 0), base_col, ~neighbour_solid(0, -1)),
+            quad([(x1, y0, z0), (x1, y1, z0), (x1, y1, hgt), (x1, y0, hgt)],
+                 (1, 0, 0), base_col, ~neighbour_solid(0, 1)),
+        ]
+
+        # Road surface, emitted as one quad per tile rather than a single plane.
+        # A featureless plane is nearly free to draw but gives a vision policy
+        # almost no optical flow, which makes speed unobservable from pixels --
+        # exactly the signal an image-based world model needs. Per-tile shading
+        # puts visible edges on the ground for the cost of ~1k extra quads.
+        grows, gcols = np.nonzero(~solid)
+        gx0 = (gcols * ts).astype(np.float32)
+        gy0 = (grows * ts).astype(np.float32)
+        gx1, gy1 = gx0 + ts, gy0 + ts
+        gz = np.zeros(len(grows), dtype=np.float32)
+        tone = (0.20 + 0.075 * _hash01(grows * 7 + 1, gcols * 13 + 3)).astype(np.float32)
+        road_col = np.stack([tone, tone * 1.04, tone * 1.10, np.ones_like(tone)], axis=1)
+        parts.append(_quads_to_mesh(
+            np.stack([np.stack(p, axis=1) for p in
+                      [(gx0, gy0, gz), (gx1, gy0, gz), (gx1, gy1, gz), (gx0, gy1, gz)]],
+                     axis=1),
+            np.tile(np.array([(0, 0, 1)], dtype=np.float32), (len(grows), 1)),
+            road_col))
+
+        self._city_np = _mesh_to_node("city", np.concatenate(parts))
+        self._city_np.reparentTo(self.base.render)
+        self._cam_pos = None
+
+    # ------------------------------------------------------------------
+    def _place_camera(self, env):
+        car = env.car
+        fx, fy = np.cos(car.heading), np.sin(car.heading)
+        want = Vec3(car.x - fx * self.cam_dist,
+                    car.y - fy * self.cam_dist,
+                    self.cam_height)
+        if self.smooth > 0.0 and self._cam_pos is not None:
+            want = self._cam_pos * self.smooth + want * (1.0 - self.smooth)
+        self._cam_pos = want
+        self.base.camera.setPos(want)
+        self.base.camera.lookAt(car.x + fx * self.look_ahead,
+                                car.y + fy * self.look_ahead, 1.2)
+
+    def _place_actors(self, env):
+        car = env.car
+        self.car_np.setPos(car.x, car.y, 0.0)
+        self.car_np.setH(np.degrees(car.heading))
+
+        # Only show waypoints still to be visited, brightest first.
+        pending = env.targets[env.target_idx:]
+        for i, np_ in enumerate(self.target_nps):
+            if i < len(pending):
+                tx, ty = pending[i]
+                np_.setPos(tx, ty, 0.0)
+                np_.setColor(*((0.15, 0.95, 0.35, 1) if i == 0
+                               else (0.85, 0.75, 0.20, 1)))
+                np_.show()
+            else:
+                np_.hide()
+
+    def _draw_rays(self, env):
+        """Overlay the LIDAR scan. Debug aid only -- off during training.
+
+        Always clears the previous frame's node first, including when the overlay
+        has just been switched off -- otherwise a stale fan of rays stays frozen
+        in the scene pointing where the car used to be.
+        """
+        if self._rays_np is not None:
+            self._rays_np.removeNode()
+            self._rays_np = None
+        lidar = getattr(env, "lidar", None)
+        if not self.show_rays or lidar is None:
+            return
+        segs = LineSegs()
+        segs.setThickness(1.6)
+        hx, hy = lidar.hit_points(env.car.x, env.car.y, env.car.heading)
+        for i in range(len(hx)):
+            frac = lidar.last_distances[i] / lidar.max_range
+            segs.setColor(1.0 - frac, 0.25 + 0.7 * frac, 0.35, 1)
+            segs.moveTo(env.car.x, env.car.y, 1.0)
+            segs.drawTo(float(hx[i]), float(hy[i]), 1.0)
+        self._rays_np = self.base.render.attachNewNode(segs.create())
+        self._rays_np.setLightOff()
+
+    def sync(self, env):
+        """Point the camera and place the actors for the current env state.
+
+        Split out from `capture` so an interactive window can let Panda drive its
+        own render loop instead of us calling renderFrame by hand.
+        """
+        if self._city_np is None:
+            self.build_scene(env.city)
+        self._place_camera(env)
+        self._place_actors(env)
+        self._draw_rays(env)
+
+    def capture(self, env, size=None):
+        """Render one frame and return it as an (H, W, 3) uint8 array."""
+        if size is not None:
+            want = (size, size) if isinstance(size, int) else tuple(size)
+            if want != self.size:
+                raise RuntimeError(
+                    f"renderer was built for {self.size} but {want} was requested; "
+                    "construct a PandaRenderer with the size you intend to use")
+        self.sync(env)
+        self.base.graphicsEngine.renderFrame()
+
+        if self._tex is None:                     # onscreen: grab the framebuffer
+            self._tex = Texture()
+            self.base.win.addRenderTexture(
+                self._tex, GraphicsOutput.RTMCopyRam, GraphicsOutput.RTPColor)
+            self.base.graphicsEngine.renderFrame()
+
+        raw = self._tex.getRamImageAs("RGB")
+        w, h = self._tex.getXSize(), self._tex.getYSize()
+        img = np.frombuffer(bytes(raw), dtype=np.uint8).reshape(h, w, 3)
+        return img[::-1].copy()                   # Panda's RAM image is bottom-up
+
+    def close(self):
+        """Drop the scene. The ShowBase singleton outlives individual renderers."""
+        if self._city_np is not None:
+            self._city_np.removeNode()
+            self._city_np = None
+        if self._rays_np is not None:
+            self._rays_np.removeNode()
+            self._rays_np = None
