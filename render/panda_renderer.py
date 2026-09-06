@@ -195,34 +195,47 @@ class PandaRenderer:
 
     def _setup_actors(self):
         """Build the car and target markers once; they are only repositioned."""
-        # Car points along +x (heading 0 = +x in world).
-        # Proportions match car.py: length 4.4 m, width 1.9 m, wheelbase 2.5 m.
-        RED   = (0.80, 0.16, 0.13, 1)   # body paint
-        DARK  = (0.13, 0.14, 0.17, 1)   # cabin glass
-        GREY  = (0.22, 0.22, 0.24, 1)   # bumpers / chassis
-        BLACK = (0.10, 0.10, 0.11, 1)   # tyres
-        HEAD  = (0.95, 0.92, 0.75, 1)   # headlights
-        TAIL  = (0.92, 0.12, 0.10, 1)   # taillights
-
-        car_parts = [
-            _box_mesh((-2.20, -0.95, 0.00), ( 2.20,  0.95, 0.18), GREY),   # chassis
-            _box_mesh((-2.10, -0.95, 0.18), ( 2.10,  0.95, 0.74), RED),    # doors
-            _box_mesh(( 0.30, -0.88, 0.74), ( 2.05,  0.88, 1.06), RED),    # hood
-            _box_mesh((-2.05, -0.88, 0.74), (-0.30,  0.88, 0.92), RED),    # boot
-            _box_mesh((-0.90, -0.80, 0.92), ( 0.52,  0.80, 1.54), DARK),   # cabin
-            _box_mesh(( 2.05, -0.92, 0.18), ( 2.28,  0.92, 0.54), GREY),   # front bumper
-            _box_mesh((-2.28, -0.92, 0.18), (-2.05,  0.92, 0.54), GREY),   # rear bumper
-            _box_mesh(( 2.05, -0.88, 0.54), ( 2.30, -0.42, 0.76), HEAD),   # headlight L
-            _box_mesh(( 2.05,  0.42, 0.54), ( 2.30,  0.88, 0.76), HEAD),   # headlight R
-            _box_mesh((-2.30, -0.88, 0.54), (-2.05, -0.42, 0.76), TAIL),   # taillight L
-            _box_mesh((-2.30,  0.42, 0.54), (-2.05,  0.88, 0.76), TAIL),   # taillight R
-            _box_mesh(( 0.87, -1.13, 0.00), ( 1.63, -0.95, 0.76), BLACK),  # tyre FL
-            _box_mesh(( 0.87,  0.95, 0.00), ( 1.63,  1.13, 0.76), BLACK),  # tyre FR
-            _box_mesh((-1.63, -1.13, 0.00), (-0.87, -0.95, 0.76), BLACK),  # tyre RL
-            _box_mesh((-1.63,  0.95, 0.00), (-0.87,  1.13, 0.76), BLACK),  # tyre RR
-        ]
+        import os
         self.car_np = self.base.render.attachNewNode("car")
-        _mesh_to_node("car_body", np.concatenate(car_parts)).reparentTo(self.car_np)
+
+        _here = os.path.dirname(os.path.abspath(__file__))
+        glb = os.path.normpath(os.path.join(
+            _here, "..", "kenney_car-kit", "Models", "GLB format", "sedan.glb"))
+
+        if os.path.exists(glb):
+            model = self.base.loader.loadModel(glb)
+            model.reparentTo(self.car_np)
+            # The Kenney sedan faces +Y after glTF load; our world forward is +X.
+            # setH(-90) on the sub-node rotates the nose from +Y to +X.
+            model.setH(90)
+            # Sedan bounding box: Y=2.55 m long.  Scale so length ≈ 4.4 m.
+            model.setScale(1.72)
+        else:
+            # Fallback: procedural box mesh (no external assets needed).
+            RED   = (0.80, 0.16, 0.13, 1)
+            DARK  = (0.13, 0.14, 0.17, 1)
+            GREY  = (0.22, 0.22, 0.24, 1)
+            BLACK = (0.10, 0.10, 0.11, 1)
+            HEAD  = (0.95, 0.92, 0.75, 1)
+            TAIL  = (0.92, 0.12, 0.10, 1)
+            car_parts = [
+                _box_mesh((-2.20, -0.95, 0.00), ( 2.20,  0.95, 0.18), GREY),
+                _box_mesh((-2.10, -0.95, 0.18), ( 2.10,  0.95, 0.74), RED),
+                _box_mesh(( 0.30, -0.88, 0.74), ( 2.05,  0.88, 1.06), RED),
+                _box_mesh((-2.05, -0.88, 0.74), (-0.30,  0.88, 0.92), RED),
+                _box_mesh((-0.90, -0.80, 0.92), ( 0.52,  0.80, 1.54), DARK),
+                _box_mesh(( 2.05, -0.92, 0.18), ( 2.28,  0.92, 0.54), GREY),
+                _box_mesh((-2.28, -0.92, 0.18), (-2.05,  0.92, 0.54), GREY),
+                _box_mesh(( 2.05, -0.88, 0.54), ( 2.30, -0.42, 0.76), HEAD),
+                _box_mesh(( 2.05,  0.42, 0.54), ( 2.30,  0.88, 0.76), HEAD),
+                _box_mesh((-2.30, -0.88, 0.54), (-2.05, -0.42, 0.76), TAIL),
+                _box_mesh((-2.30,  0.42, 0.54), (-2.05,  0.88, 0.76), TAIL),
+                _box_mesh(( 0.87, -1.13, 0.00), ( 1.63, -0.95, 0.76), BLACK),
+                _box_mesh(( 0.87,  0.95, 0.00), ( 1.63,  1.13, 0.76), BLACK),
+                _box_mesh((-1.63, -1.13, 0.00), (-0.87, -0.95, 0.76), BLACK),
+                _box_mesh((-1.63,  0.95, 0.00), (-0.87,  1.13, 0.76), BLACK),
+            ]
+            _mesh_to_node("car_body", np.concatenate(car_parts)).reparentTo(self.car_np)
 
         # A tall thin post is visible over buildings and from any bearing, which
         # matters because the marker has to be findable, not just pretty.
@@ -332,6 +345,26 @@ class PandaRenderer:
         lft_x, lft_z = -fwd_z, fwd_x      # CCW 90° of forward
 
         segs = LineSegs()
+
+        # Proximity ring — radius = nearest LIDAR hit, colour: green (clear) → red (close).
+        lidar = getattr(env, "lidar", None)
+        if lidar is not None and hasattr(lidar, "last_distances"):
+            min_dist = float(np.min(lidar.last_distances))
+            t = np.clip(min_dist / lidar.max_range, 0.0, 1.0)
+            ex, _ = self._mm_extent
+            scale = (self._MM_X1 - self._MM_X0) / ex
+            radius = min(min_dist * scale, (self._MM_X1 - self._MM_X0) * 0.42)
+            segs.setThickness(2.0)
+            segs.setColor(1.0 - t, t, 0.05, 0.85)
+            N = 32
+            for i in range(N + 1):
+                a = 2.0 * np.pi * i / N
+                px = cx + np.cos(a) * radius
+                pz = cz + np.sin(a) * radius
+                if i == 0:
+                    segs.moveTo(px, 0, pz)
+                else:
+                    segs.drawTo(px, 0, pz)
 
         # Car as a filled triangle: tip forward, base behind.
         sz = 0.020

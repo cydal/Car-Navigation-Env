@@ -6,10 +6,11 @@ with the specific goal of supporting **both** vector and image observations so
 world-model experiments are not forced to choose.
 
 ```
-python main.py spec     # observation / action contract
-python main.py demo     # live window, scripted driver, LIDAR overlay
-python main.py bench    # throughput, vector vs image
-python main.py shots    # save a grid of 64x64 agent-view frames
+python main.py spec           # observation / action contract
+python main.py demo           # live window, scripted driver, LIDAR overlay
+python main.py demo --keys    # same but drive it yourself (arrow keys + brake)
+python main.py bench          # throughput, vector vs image
+python main.py shots          # save a grid of 64x64 agent-view frames
 ```
 
 ## Why this exists
@@ -29,7 +30,7 @@ Both paths are live, and the cost of each is measured (see Performance).
 
 ## Layout
 
-| file | role |
+| path | role |
 |---|---|
 | `env/world.py` | procedural city grid, ray casting, collision, spawn sampling |
 | `env/car.py` | kinematic bicycle model with a rate-limited steering actuator |
@@ -38,6 +39,7 @@ Both paths are live, and the cost of each is measured (see Performance).
 | `render/panda_renderer.py` | Panda3D third-person renderer (offscreen or windowed) |
 | `baselines/scripted.py` | follow-the-gap + pure-pursuit driver, obs-only |
 | `tests/` | core, env and render suites, plus two diagnostic scripts |
+| `kenney_car-kit/` | CC0 low-poly vehicle assets (Kenney.nl); only used by the renderer |
 
 The renderer is **injected**, never imported by the simulation. Headless training
 never loads a graphics stack, and `test_core` / `test_env` run without panda3d
@@ -86,6 +88,47 @@ waypoint reached, `−100` for a crash.
 Early termination on "stuck" charges the *remaining* time penalty as a lump sum,
 so ending an episode early is reward-neutral. Otherwise stopping dead would be a
 cheap way to escape the per-step cost, and the agent would learn to park.
+
+## Visualisation
+
+`main.py demo` opens a Panda3D window with three layers:
+
+**3D chase camera** — third-person view following the car.  The car mesh is a
+Kenney CC0 sedan scaled to match the physics car (≈ 4.4 m long).  The green
+beacon posts mark the next waypoints; the brightest one is the current target.
+Fog hides the map boundary and gives depth cues.
+
+**Minimap (top-right corner)** — a top-down view of the full city.  Buildings
+are warm grey, road is dark blue-grey.  Elements:
+
+| element | meaning |
+|---|---|
+| orange triangle | car — tip = nose, tail = rear |
+| bright green square | current target waypoint |
+| yellow squares | upcoming waypoints (in order) |
+| coloured ring | proximity indicator — radius = nearest LIDAR hit; **green** = plenty of clearance, **red** = very close |
+
+The proximity ring gives an at-a-glance danger signal without cluttering the map
+with 32 individual ray lines.  Those are kept available for future use (e.g.
+visualising a world model's imagined scene in a separate overlay).
+
+**LIDAR overlay (3D, optional)** — set `show_rays=True` when constructing
+`PandaRenderer` to draw the 32-beam scan fan in the 3D scene.  Off by default
+so it does not appear in image observations.
+
+**Keyboard controls** (`--keys` flag):
+
+| key | action |
+|---|---|
+| ↑ arrow | throttle |
+| ↓ arrow | brake |
+| ← / → arrow | steer left / right |
+
+The scripted driver runs when `--keys` is not set.  Both use the same 46-D
+observation vector — no privileged simulator access.
+
+**Offscreen vs windowed** — when `offscreen=True` (training), the minimap
+overlay is suppressed so it never enters the image observation.
 
 ## Performance
 
