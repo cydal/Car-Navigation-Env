@@ -195,12 +195,34 @@ class PandaRenderer:
 
     def _setup_actors(self):
         """Build the car and target markers once; they are only repositioned."""
-        # Car geometry points along +x, matching heading 0 in the simulation.
-        body = _box_mesh((-2.2, -0.95, 0.25), (2.2, 0.95, 1.0), (0.80, 0.16, 0.13, 1))
-        cabin = _box_mesh((-1.1, -0.80, 1.0), (0.9, 0.80, 1.55), (0.12, 0.14, 0.18, 1))
+        # Car points along +x (heading 0 = +x in world).
+        # Proportions match car.py: length 4.4 m, width 1.9 m, wheelbase 2.5 m.
+        RED   = (0.80, 0.16, 0.13, 1)   # body paint
+        DARK  = (0.13, 0.14, 0.17, 1)   # cabin glass
+        GREY  = (0.22, 0.22, 0.24, 1)   # bumpers / chassis
+        BLACK = (0.10, 0.10, 0.11, 1)   # tyres
+        HEAD  = (0.95, 0.92, 0.75, 1)   # headlights
+        TAIL  = (0.92, 0.12, 0.10, 1)   # taillights
+
+        car_parts = [
+            _box_mesh((-2.20, -0.95, 0.00), ( 2.20,  0.95, 0.18), GREY),   # chassis
+            _box_mesh((-2.10, -0.95, 0.18), ( 2.10,  0.95, 0.74), RED),    # doors
+            _box_mesh(( 0.30, -0.88, 0.74), ( 2.05,  0.88, 1.06), RED),    # hood
+            _box_mesh((-2.05, -0.88, 0.74), (-0.30,  0.88, 0.92), RED),    # boot
+            _box_mesh((-0.90, -0.80, 0.92), ( 0.52,  0.80, 1.54), DARK),   # cabin
+            _box_mesh(( 2.05, -0.92, 0.18), ( 2.28,  0.92, 0.54), GREY),   # front bumper
+            _box_mesh((-2.28, -0.92, 0.18), (-2.05,  0.92, 0.54), GREY),   # rear bumper
+            _box_mesh(( 2.05, -0.88, 0.54), ( 2.30, -0.42, 0.76), HEAD),   # headlight L
+            _box_mesh(( 2.05,  0.42, 0.54), ( 2.30,  0.88, 0.76), HEAD),   # headlight R
+            _box_mesh((-2.30, -0.88, 0.54), (-2.05, -0.42, 0.76), TAIL),   # taillight L
+            _box_mesh((-2.30,  0.42, 0.54), (-2.05,  0.88, 0.76), TAIL),   # taillight R
+            _box_mesh(( 0.87, -1.13, 0.00), ( 1.63, -0.95, 0.76), BLACK),  # tyre FL
+            _box_mesh(( 0.87,  0.95, 0.00), ( 1.63,  1.13, 0.76), BLACK),  # tyre FR
+            _box_mesh((-1.63, -1.13, 0.00), (-0.87, -0.95, 0.76), BLACK),  # tyre RL
+            _box_mesh((-1.63,  0.95, 0.00), (-0.87,  1.13, 0.76), BLACK),  # tyre RR
+        ]
         self.car_np = self.base.render.attachNewNode("car")
-        _mesh_to_node("body", body).reparentTo(self.car_np)
-        _mesh_to_node("cabin", cabin).reparentTo(self.car_np)
+        _mesh_to_node("car_body", np.concatenate(car_parts)).reparentTo(self.car_np)
 
         # A tall thin post is visible over buildings and from any bearing, which
         # matters because the marker has to be findable, not just pretty.
@@ -294,7 +316,7 @@ class PandaRenderer:
         return float(rx), float(rz)
 
     def _update_minimap(self, env):
-        """Rebuild the car arrow + LIDAR fan + waypoint markers each frame."""
+        """Rebuild the car arrow + waypoint markers each frame."""
         if self._mm_car_np is not None:
             self._mm_car_np.removeNode()
             self._mm_car_np = None
@@ -310,18 +332,6 @@ class PandaRenderer:
         lft_x, lft_z = -fwd_z, fwd_x      # CCW 90° of forward
 
         segs = LineSegs()
-
-        # LIDAR beams projected top-down onto the minimap.
-        lidar = getattr(env, "lidar", None)
-        if lidar is not None:
-            hx, hy = lidar.hit_points(car.x, car.y, car.heading)
-            segs.setThickness(1.0)
-            for i in range(len(hx)):
-                frac = lidar.last_distances[i] / lidar.max_range
-                segs.setColor(1.0 - frac * 0.85, 0.18 + frac * 0.72, 0.30, 0.65)
-                ex, ez = self._world_to_mm(float(hx[i]), float(hy[i]))
-                segs.moveTo(cx, 0, cz)
-                segs.drawTo(ex, 0, ez)
 
         # Car as a filled triangle: tip forward, base behind.
         sz = 0.020
