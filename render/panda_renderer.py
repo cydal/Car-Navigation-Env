@@ -30,7 +30,7 @@ loadPrcFileData("", "sync-video 0")              # never block on vsync
 loadPrcFileData("", "notify-level-display error")
 
 from panda3d.core import (  # noqa: E402
-    AmbientLight, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
+    AmbientLight, CardMaker, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
     GeomVertexArrayFormat, GeomVertexData, GeomVertexFormat, GraphicsOutput,
     InternalName, LineSegs, NodePath, Texture, Vec3, Vec4,
 )
@@ -133,7 +133,7 @@ class PandaRenderer:
 
     def __init__(self, offscreen=True, size=64, fov=60.0,
                  cam_dist=13.0, cam_height=6.5, look_ahead=9.0, smooth=0.0,
-                 build_min=6.0, build_max=24.0, show_rays=False):
+                 build_min=6.0, build_max=24.0, show_rays=False, show_minimap=None):
         self.size = (size, size) if isinstance(size, int) else tuple(size)
         self.offscreen = offscreen
         self.cam_dist = cam_dist
@@ -141,6 +141,9 @@ class PandaRenderer:
         self.look_ahead = look_ahead
         self.smooth = smooth          # 0 = stateless (required for training)
         self.show_rays = show_rays    # LIDAR overlay; debug/visualisation only
+        # Minimap is on by default for onscreen (demo) windows, off for offscreen
+        # (training image captures) so the map overlay never enters training obs.
+        self.show_minimap = show_minimap if show_minimap is not None else (not offscreen)
         self.build_min = build_min
         self.build_max = build_max
 
@@ -154,6 +157,16 @@ class PandaRenderer:
         self._cam_pos = None          # only used when smooth > 0
         self._setup_lights()
         self._setup_actors()
+
+        # 2-D overlay minimap (top-right corner, onscreen only).
+        self._mm_np = None
+        self._mm_city_np = None
+        self._mm_city_tex = None
+        self._mm_car_np = None
+        self._mm_wpt_nps = []
+        self._mm_extent = (1.0, 1.0)
+        if self.show_minimap:
+            self._setup_minimap_frame()
 
         self._tex = None
         if offscreen:
@@ -200,6 +213,147 @@ class PandaRenderer:
             post.setLightOff()          # emissive-looking, reads as a beacon
             post.hide()
             self.target_nps.append(post)
+
+    # ------------------------------------------------------------------
+    # Minimap (2D top-down overlay)
+    # ------------------------------------------------------------------
+
+    # Minimap bounds in render2d coordinates (-1..1 on a square window).
+    _MM_X0, _MM_X1 = 0.54, 0.98
+    _MM_Z0, _MM_Z1 = 0.56, 0.98
+
+    def _setup_minimap_frame(self):
+        """Create the fixed skeleton: background, city card, waypoint markers."""
+        self._mm_np = self.base.render2d.attachNewNode("minimap")
+
+        pad = 0.028
+        cm = CardMaker("mm_bg")
+        cm.setFrame(self._MM_X0 - pad, self._MM_X1 + pad,
+                    self._MM_Z0 - pad, self._MM_Z1 + pad)
+        bg = self._mm_np.attachNewNode(cm.generate())
+        bg.setColor(0.06, 0.07, 0.09, 1)
+
+        # City texture quad (texture data filled on each build_scene).
+        self._mm_city_tex = Texture("mm_city")
+        cm2 = CardMaker("mm_city")
+        cm2.setFrame(self._MM_X0, self._MM_X1, self._MM_Z0, self._MM_Z1)
+        self._mm_city_np = self._mm_np.attachNewNode(cm2.generate())
+        self._mm_city_np.setTexture(self._mm_city_tex)
+
+        # Border drawn on top of the city quad.
+        brd = LineSegs()
+        brd.setColor(0.55, 0.58, 0.62, 1)
+        brd.setThickness(1.5)
+        brd.moveTo(self._MM_X0, 0, self._MM_Z0)
+        brd.drawTo(self._MM_X1, 0, self._MM_Z0)
+        brd.drawTo(self._MM_X1, 0, self._MM_Z1)
+        brd.drawTo(self._MM_X0, 0, self._MM_Z1)
+        brd.drawTo(self._MM_X0, 0, self._MM_Z0)
+        self._mm_np.attachNewNode(brd.create()).setLightOff()
+
+        # Waypoint squares — repositioned each frame, 8 slots for any task size.
+        sq = 0.015
+        for _ in range(8):
+            cm3 = CardMaker("mm_wpt")
+            cm3.setFrame(-sq, sq, -sq, sq)
+            wpt = self._mm_np.attachNewNode(cm3.generate())
+            wpt.setLightOff()
+            wpt.hide()
+            self._mm_wpt_nps.append(wpt)
+
+    def _build_minimap_texture(self, city):
+        """Upload a fresh top-down city image to the minimap texture card."""
+        S = 2   # pixels per tile — enough to see street grid without blurring
+        h, w = city.height * S, city.width * S
+        arr = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Expand the grid (each tile → S×S pixels) with np.kron — fast, one op.
+        expanded = np.kron(city.grid, np.ones((S, S), dtype=city.grid.dtype))
+        arr[expanded == 0] = (38, 42, 46)    # road — dark blue-grey
+        arr[expanded == 1] = (82, 78, 74)    # building — warm grey
+
+        # Panda reads RAM images bottom-up; flip rows so row 0 (top of map)
+        # appears at the top of the minimap quad.
+        self._mm_city_tex.setup2dTexture(w, h, Texture.T_unsigned_byte,
+                                         Texture.F_rgb8)
+        self._mm_city_tex.setRamImage(arr[::-1].tobytes())
+        self._mm_city_tex.setMagfilter(Texture.FTNearest)
+        self._mm_city_tex.setMinfilter(Texture.FTNearest)
+        self._mm_extent = city.extent          # (W*ts, H*ts)
+
+    def _world_to_mm(self, wx, wy):
+        """World (x, y) → render2d minimap (rx, rz).
+
+        World +X maps to minimap right (+rx); world +Y maps to minimap down
+        (-rz) because the world's +Y axis points down the screen and render2d's
+        +Z points up.
+        """
+        ex, ey = self._mm_extent
+        rx = self._MM_X0 + (wx / ex) * (self._MM_X1 - self._MM_X0)
+        rz = self._MM_Z1 - (wy / ey) * (self._MM_Z1 - self._MM_Z0)
+        return float(rx), float(rz)
+
+    def _update_minimap(self, env):
+        """Rebuild the car arrow + LIDAR fan + waypoint markers each frame."""
+        if self._mm_car_np is not None:
+            self._mm_car_np.removeNode()
+            self._mm_car_np = None
+
+        car = env.car
+        cx, cz = self._world_to_mm(car.x, car.y)
+
+        # Forward and left unit vectors in minimap/render2d space.
+        # heading 0 = world +X (right on minimap), increasing CW.
+        # World +Y points DOWN, so it maps to minimap -Z.
+        fwd_x = np.cos(car.heading)
+        fwd_z = -np.sin(car.heading)
+        lft_x, lft_z = -fwd_z, fwd_x      # CCW 90° of forward
+
+        segs = LineSegs()
+
+        # LIDAR beams projected top-down onto the minimap.
+        lidar = getattr(env, "lidar", None)
+        if lidar is not None:
+            hx, hy = lidar.hit_points(car.x, car.y, car.heading)
+            segs.setThickness(1.0)
+            for i in range(len(hx)):
+                frac = lidar.last_distances[i] / lidar.max_range
+                segs.setColor(1.0 - frac * 0.85, 0.18 + frac * 0.72, 0.30, 0.65)
+                ex, ez = self._world_to_mm(float(hx[i]), float(hy[i]))
+                segs.moveTo(cx, 0, cz)
+                segs.drawTo(ex, 0, ez)
+
+        # Car as a filled triangle: tip forward, base behind.
+        sz = 0.020
+        tip_x = cx + fwd_x * sz
+        tip_z = cz + fwd_z * sz
+        bl_x = cx - fwd_x * sz * 0.6 + lft_x * sz * 0.6
+        bl_z = cz - fwd_z * sz * 0.6 + lft_z * sz * 0.6
+        br_x = cx - fwd_x * sz * 0.6 - lft_x * sz * 0.6
+        br_z = cz - fwd_z * sz * 0.6 - lft_z * sz * 0.6
+
+        segs.setThickness(2.5)
+        segs.setColor(1.0, 0.38, 0.08, 1.0)
+        segs.moveTo(bl_x, 0, bl_z)
+        segs.drawTo(tip_x, 0, tip_z)
+        segs.drawTo(br_x, 0, br_z)
+        segs.drawTo(bl_x, 0, bl_z)
+
+        self._mm_car_np = self._mm_np.attachNewNode(segs.create())
+        self._mm_car_np.setLightOff()
+
+        # Waypoint squares — just reposition, colour, and show/hide.
+        pending = list(env.targets[env.target_idx:])
+        for i, wpt_np in enumerate(self._mm_wpt_nps):
+            if i < len(pending):
+                tx, ty = pending[i]
+                mx, mz = self._world_to_mm(tx, ty)
+                wpt_np.setPos(mx, 0, mz)
+                wpt_np.setColor(*((0.22, 0.95, 0.38, 1) if i == 0
+                                  else (0.92, 0.76, 0.15, 1)))
+                wpt_np.show()
+            else:
+                wpt_np.hide()
 
     # ------------------------------------------------------------------
     def build_scene(self, city):
@@ -278,6 +432,9 @@ class PandaRenderer:
         self._city_np.reparentTo(self.base.render)
         self._cam_pos = None
 
+        if self.show_minimap and self._mm_city_tex is not None:
+            self._build_minimap_texture(city)
+
     # ------------------------------------------------------------------
     def _place_camera(self, env):
         car = env.car
@@ -344,6 +501,8 @@ class PandaRenderer:
         self._place_camera(env)
         self._place_actors(env)
         self._draw_rays(env)
+        if self.show_minimap:
+            self._update_minimap(env)
 
     def capture(self, env, size=None):
         """Render one frame and return it as an (H, W, 3) uint8 array."""
@@ -375,3 +534,7 @@ class PandaRenderer:
         if self._rays_np is not None:
             self._rays_np.removeNode()
             self._rays_np = None
+        if self._mm_np is not None:
+            self._mm_np.removeNode()
+            self._mm_np = None
+            self._mm_car_np = None
