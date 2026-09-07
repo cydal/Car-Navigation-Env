@@ -453,7 +453,19 @@ class PandaRenderer:
             np.tile(np.array([(0, 0, 1)], dtype=np.float32), (len(grows), 1)),
             road_col))
 
-        self._city_np = _mesh_to_node("city", np.concatenate(parts))
+        city_verts = np.concatenate(parts)
+        # Physics Y increases "screen-down" (map convention); Panda3D is right-hand
+        # Z-up where +Y is "north".  Bake the Y-mirror directly into vertex data
+        # so all 3D placements can use (x, -physics_y) coordinates throughout.
+        city_verts['v'][:, 1] *= -1
+        city_verts['n'][:, 1] *= -1
+        # Negating Y reverses each triangle's winding from CCW to CW (back-facing).
+        # Restore front-face orientation by swapping v1↔v2 in every triangle.
+        # Vertices are a flat list; stride-3 indexing hits exactly v1 and v2.
+        tmp = city_verts[1::3].copy()
+        city_verts[1::3] = city_verts[2::3]
+        city_verts[2::3] = tmp
+        self._city_np = _mesh_to_node("city", city_verts)
         self._city_np.reparentTo(self.base.render)
         self._cam_pos = None
 
@@ -464,24 +476,21 @@ class PandaRenderer:
     def _place_camera(self, env):
         car = env.car
         fx, fy = np.cos(car.heading), np.sin(car.heading)
-        # The 3D scene uses physics (x, y) coordinates directly, but Panda3D's
-        # right-hand Z-up system has the opposite Y-chirality from the physics
-        # world (where Y increases "south"/screen-down).  With setH(-degrees) on
-        # the car mesh, the nose faces (cos h, -sin h) in world space.  Place the
-        # camera behind that direction (+sin offset) and look forward (-sin offset).
+        # City/car/beacons all live in Panda's Y-mirrored world (-physics_y).
+        # Camera behind car: car_panda − panda_fwd·dist, where panda_fwd=(cos h, −sin h).
         want = Vec3(car.x - fx * self.cam_dist,
-                    car.y + fy * self.cam_dist,
+                    -car.y + fy * self.cam_dist,
                     self.cam_height)
         if self.smooth > 0.0 and self._cam_pos is not None:
             want = self._cam_pos * self.smooth + want * (1.0 - self.smooth)
         self._cam_pos = want
         self.base.camera.setPos(want)
         self.base.camera.lookAt(car.x + fx * self.look_ahead,
-                                car.y - fy * self.look_ahead, 1.2)
+                                -car.y - fy * self.look_ahead, 1.2)
 
     def _place_actors(self, env):
         car = env.car
-        self.car_np.setPos(car.x, car.y, 0.0)
+        self.car_np.setPos(car.x, -car.y, 0.0)       # Y-mirrored world
         self.car_np.setH(-np.degrees(car.heading))
 
         # Only show waypoints still to be visited, brightest first.
@@ -489,7 +498,7 @@ class PandaRenderer:
         for i, np_ in enumerate(self.target_nps):
             if i < len(pending):
                 tx, ty = pending[i]
-                np_.setPos(tx, ty, 0.0)
+                np_.setPos(tx, -ty, 0.0)              # Y-mirrored world
                 np_.setColor(*((0.15, 0.95, 0.35, 1) if i == 0
                                else (0.85, 0.75, 0.20, 1)))
                 np_.show()
@@ -514,19 +523,19 @@ class PandaRenderer:
         n_beams = len(dists)
         max_r = float(lidar.max_range)
         heading = float(env.car.heading)
-        cx, cy = env.car.x, env.car.y
+        # Ring is drawn in Panda's Y-mirrored world; car sits at (x, -y).
+        cx, cy = env.car.x, -env.car.y
 
         segs = LineSegs()
         segs.setThickness(3.0)
         radius = 3.0   # metres, just outside the car body
 
-        # Draw N ring vertices; each vertex looks up the nearest LIDAR beam.
-        # Beam k sits at world angle (heading + π + 2π·k/n_beams):
-        #   k=0 → heading+π (rear), k=n/2 → heading (front).
+        # Ring angle `a` is in Panda space.  Convert to physics angle (-a) to
+        # look up the right LIDAR beam (beam k at physics heading+π+2πk/n).
         N = 64
         for i in range(N + 1):
             a = 2.0 * np.pi * i / N
-            rel = (a - heading - np.pi) % (2.0 * np.pi)
+            rel = (-a - heading - np.pi) % (2.0 * np.pi)
             k = int(round(rel * n_beams / (2.0 * np.pi))) % n_beams
             t = float(np.clip(dists[k] / max_r, 0.0, 1.0))
             segs.setColor(1.0 - t, t, 0.05, 0.9)
