@@ -32,16 +32,36 @@ except ImportError:                     # pragma: no cover
 
 
 class _Box:
-    """Minimal Box stand-in so the env is usable without gymnasium installed."""
+    """Minimal Box stand-in so the env is usable without gymnasium installed.
+
+    It carries its own generator rather than drawing from the global
+    `np.random`, because `action_space.sample()` is what a random-policy
+    reference run uses and an unseeded global makes that run unreproducible --
+    the one property the rest of this env works hardest to guarantee.
+    """
 
     def __init__(self, low, high, shape, dtype=np.float32):
         self.low = np.full(shape, low, dtype=dtype) if np.isscalar(low) else np.asarray(low, dtype=dtype)
         self.high = np.full(shape, high, dtype=dtype) if np.isscalar(high) else np.asarray(high, dtype=dtype)
         self.shape = tuple(shape)
         self.dtype = dtype
+        self._rng = np.random.default_rng()
+
+    def seed(self, seed=None):
+        self._rng = np.random.default_rng(seed)
 
     def sample(self):
-        return np.random.uniform(self.low, self.high).astype(self.dtype)
+        if np.issubdtype(self.dtype, np.integer):
+            return self._rng.integers(self.low, np.int64(self.high) + 1,
+                                      size=self.shape).astype(self.dtype)
+        return self._rng.uniform(self.low, self.high).astype(self.dtype)
+
+    def contains(self, x):
+        x = np.asarray(x)
+        return (x.shape == self.shape and np.all(x >= self.low - 1e-5)
+                and np.all(x <= self.high + 1e-5))
+
+    __contains__ = contains
 
     def __repr__(self):
         return f"Box({self.low.min()}, {self.high.max()}, {self.shape}, {self.dtype.__name__})"
@@ -222,6 +242,8 @@ class CarNavEnv(_BaseEnv):
         self.image_size = image_size
         self._renderer = renderer
 
+        # Provisional: `seed_all` at the end of __init__ replaces this, but Traffic
+        # is handed a generator at construction so one has to exist by then.
         self.rng = np.random.default_rng(seed)
         city_cfg = city_config or CityConfig()
         # The renderer draws signal masts from `city.signals`, so if the city kept
@@ -272,14 +294,99 @@ class CarNavEnv(_BaseEnv):
             else:
                 self.observation_space = {"vector": vec_space, "image": img_space}
 
+        # Seeding is centralised *after* the spaces exist, because the spaces draw
+        # too. Doing it here as well as in `reset` is what makes the two ways of
+        # seeding an env agree; see `seed_all`.
+        self.seed_all(seed)
+        if not self.cfg.randomize_map:
+            # A fixed layout has no reset-time `generate` to produce it, so it has
+            # to be drawn from the seeded stream here. When the map *is* resampled,
+            # regenerating here instead advances the city stream by one draw, which
+            # is what made `CarNavEnv(seed=s).reset()` and
+            # `CarNavEnv().reset(seed=s)` return two different episodes.
+            self.city.generate()
+
+    # ------------------------------------------------------------------
+    # Observation layout
+    # ------------------------------------------------------------------
+    @property
+    def obs_slices(self):
+        """Name -> slice into the vector observation, for the configured widths.
+
+        Exposed because every consumer outside this file needs it and each one
+        would otherwise recompute the offsets from `n_beams`, `n_lookahead`,
+        `n_tl_obs` and `n_traffic_obs`. That has already gone wrong once: the
+        scripted baseline took "the rest of the vector" as the traffic-light
+        block, which kept working until traffic was appended behind it and then
+        fed vehicle features to the signal logic. A world model that wants to
+        weight the LIDAR block differently from the nav block, or decode them with
+        separate heads, needs the same numbers -- so there is one source for them.
+
+        Blocks that are switched off are present as empty slices rather than
+        absent, so `obs[sl["traffic"]]` is always valid and returns nothing when
+        there is no traffic.
+        """
+        c = self.cfg
+        w = [("lidar", c.n_beams), ("dynamics", 5), ("nav", 3 * c.n_lookahead),
+             ("traffic_light", TL_FEATURES * c.n_tl_obs),
+             ("traffic", TRAFFIC_FEATURES * c.n_traffic_obs)]
+        out, i = {}, 0
+        for name, n in w:
+            out[name] = slice(i, i + n)
+            i += n
+        assert i == self.vector_dim, f"{i} != {self.vector_dim}"
+        return out
+
+    # ------------------------------------------------------------------
+    # Seeding
+    # ------------------------------------------------------------------
+    def seed_all(self, seed=None):
+        """Single entry point for randomness. Reseeds every subsystem that draws.
+
+        Two things here are deliberate and both were bugs first.
+
+        *Every* subsystem is reseeded, not just some. `reset(seed=s)` used to
+        rebind the env's generator and forward it to the city and the LIDAR but
+        not to `Traffic`, which kept the generator it was handed at construction.
+        The effect was that `reset(seed=7)` twice on one env gave two different
+        episodes -- same map, same spawn, different traffic -- so a run was only
+        reproducible if you also rebuilt the env, which is not how any training
+        loop is written. The existing determinism test missed it because it
+        constructed a fresh env per rollout.
+
+        Each subsystem gets an *independent* stream spawned from the seed rather
+        than a shared generator. Sharing one couples them through draw order:
+        adding a single `rng.uniform` to the traffic spawner would then silently
+        change every city layout, so an experiment could not be reproduced across
+        a code change that had nothing to do with it.
+        """
+        ss = np.random.SeedSequence(seed)
+        env_ss, city_ss, lidar_ss, traffic_ss, space_ss, gym_ss = ss.spawn(6)
+        self.rng = np.random.default_rng(env_ss)
+        self.city.rng = np.random.default_rng(city_ss)
+        self.lidar.rng = np.random.default_rng(lidar_ss)
+        self.traffic.rng = np.random.default_rng(traffic_ss)
+        space_seed = int(space_ss.generate_state(1, dtype=np.uint32)[0])
+        for space in (self.action_space, self.observation_space):
+            if hasattr(space, "seed"):
+                space.seed(space_seed)
+        if _HAS_GYM:
+            # `env.np_random` is part of the gymnasium Env contract: wrappers read
+            # it and `utils.env_checker` fails the env outright if a seeded reset
+            # leaves it unset, which it did. The simulation itself never draws from
+            # it -- it has its own streams above -- so it gets a sixth spawned
+            # stream rather than sharing one, keeping the guarantee that nothing a
+            # wrapper draws can shift a map layout.
+            self._np_random = np.random.default_rng(gym_ss)
+            self._np_random_seed = -1 if seed is None else int(seed)
+        self._seed = seed
+
     # ------------------------------------------------------------------
     # Episode lifecycle
     # ------------------------------------------------------------------
     def reset(self, seed=None, options=None):
         if seed is not None:
-            self.rng = np.random.default_rng(seed)
-            self.city.rng = self.rng
-            self.lidar.rng = self.rng
+            self.seed_all(seed)
 
         if self.cfg.randomize_map:
             self.city.generate()

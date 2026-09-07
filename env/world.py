@@ -162,11 +162,22 @@ class ProceduralCity:
 
         Greedy farthest-first over a shuffled candidate list, so signals land on
         different streets rather than clustering along one corridor.
+
+        The shuffle is drawn even when no signal will be placed. Returning early
+        on `max_signals <= 0` left the generator one draw behind, so switching
+        lights off shifted every subsequent draw -- the spawn pose, the waypoints,
+        the next map -- and the lights-off configuration was therefore measured on
+        a *different* set of episodes from the lights-on one. That silently turns
+        "what do signals cost the agent?" into "what do signals cost, plus an
+        unrelated resample of 300 maps", which is how a lights-only run came to
+        score higher than no lights at all.
         """
         cfg = self.cfg
-        if not candidates or cfg.max_signals <= 0:
+        if not candidates:
             return []
         order = self.rng.permutation(len(candidates))
+        if cfg.max_signals <= 0:
+            return []
         chosen = []
         for i in order:
             x, y = candidates[i]

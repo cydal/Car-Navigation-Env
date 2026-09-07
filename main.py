@@ -39,17 +39,24 @@ def cmd_spec(args):
     env = build_env(args, "vector")
     c = env.cfg
     p = env.car.p
+    # Widths come from env.obs_slices rather than being recomputed here, so this
+    # listing cannot drift from the observation it describes.
+    desc = {
+        "lidar": f"360 deg, {c.lidar_range:.0f} m range, normalised to [0,1]",
+        "dynamics": "speed, yaw rate, steer angle, accel, slip",
+        "nav": f"{c.n_lookahead} waypoints x (dist, sin, cos) of bearing",
+        "traffic_light": f"{c.n_tl_obs} x (dist to stop line, sin, cos, red, yellow, "
+                        f"green, steps to change)",
+        "traffic": f"nearest {c.n_traffic_obs} moving vehicles x (dist, sin, cos, "
+                   f"rel vx, rel vy)",
+    }
     print("OBSERVATION (vector)")
-    print(f"  {c.n_beams:>3} lidar        360 deg, {c.lidar_range:.0f} m range, normalised to [0,1]")
-    print(f"  {5:>3} dynamics     speed, yaw rate, steer angle, accel, slip")
-    print(f"  {3*c.n_lookahead:>3} navigation   {c.n_lookahead} waypoints x (dist, sin, cos) of bearing")
-    if c.n_tl_obs:
-        print(f"  {7*c.n_tl_obs:>3} lights       {c.n_tl_obs} x (dist to stop line, sin, cos, "
-              f"red, yellow, green, steps to change)")
-    if c.n_traffic_obs:
-        print(f"  {5*c.n_traffic_obs:>3} traffic      nearest {c.n_traffic_obs} moving vehicles x "
-              f"(dist, sin, cos, rel vx, rel vy)")
-    print(f"  {env.vector_dim:>3} total        ego-centric only -- no absolute position or heading")
+    for name, sl in env.obs_slices.items():
+        n = sl.stop - sl.start
+        if n:
+            print(f"  [{sl.start:>2}:{sl.stop:<2}] {n:>3} {name:<14} {desc[name]}")
+    print(f"           {env.vector_dim:>3} {'total':<14} "
+          f"ego-centric only -- no absolute position or heading")
     print()
     print("ACTION  Box(-1, 1, (3,))   throttle, brake, steer  (throttle/brake rescaled to [0,1])")
     print()

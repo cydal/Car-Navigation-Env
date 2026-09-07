@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-env3d"
+version = "0.4.0"
+description = "3D car navigation environment for RL and world-model experiments"
+requires-python = ">=3.9"
+# numpy is the only hard dependency. Gymnasium and Panda3D are deliberately
+# optional: headless vector-observation training must never pull in a graphics
+# stack, and the env works without gymnasium via a small Box shim.
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+gym = ["gymnasium>=0.29"]          # gym.make ids, wrappers, vector envs
+render = ["panda3d>=1.10", "pillow>=9"]   # image observations, demo window, shots
+dev = ["gymnasium>=0.29", "panda3d>=1.10", "pillow>=9"]
+
+[tool.setuptools]
+# Flat top-level packages, as the repo is laid out. `env` is a generic name, so
+# prefer a dedicated virtualenv for an editable install; INTEGRATION.md documents
+# a PYTHONPATH alternative that installs nothing.
+packages = ["env", "render", "baselines", "tasks"]
+py-modules = ["carnav", "main"]

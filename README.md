@@ -13,6 +13,18 @@ python main.py bench          # throughput, vector vs image
 python main.py shots          # save a grid of 64x64 agent-view frames
 ```
 
+**Writing a learner against this env? Read [INTEGRATION.md](INTEGRATION.md).** It is
+the contract an outside algorithm depends on — observation slices, reward
+decomposition, `terminated` vs `truncated`, the seeding guarantees, vectorisation —
+and every claim in it is enforced by `tests/test_integration.py`. This README
+explains *why* the env is built the way it is; that one tells you how to consume it.
+
+```python
+import carnav
+env = carnav.make()                                    # 73-D vector obs
+env = carnav.make(traffic=False, traffic_lights=False)  # 46-D, the plain nav task
+```
+
 ## Why this exists
 
 The old environment gave a 9-dimensional state: seven binary "is there road at
@@ -38,14 +50,20 @@ Both paths are live, and the cost of each is measured (see Performance).
 | `env/traffic.py` | on-rails moving vehicles and kerbside parked cars |
 | `env/nav_env.py` | Gymnasium-style env: observations, reward, termination, traffic-light state |
 | `render/panda_renderer.py` | Panda3D third-person renderer (offscreen or windowed) |
+| `carnav.py` | the public surface: `carnav.make(**flat_kwargs)`, `make_factory`, `gym.make` ids |
 | `baselines/scripted.py` | follow-the-gap + pure-pursuit driver, obs-only |
-| `tests/` | core, env and render suites, plus two diagnostic scripts |
+| `tests/` | core, env, render and integration suites, plus two diagnostic scripts |
+| `INTEGRATION.md` | the contract for algorithm implementers |
 | `kenney_car-kit/` | CC0 low-poly vehicle assets (Kenney.nl); only used by the renderer |
 
 The renderer is **injected**, never imported by the simulation. Headless training
-never loads a graphics stack, and `test_core` / `test_env` run without panda3d
-installed at all. Gymnasium is optional too — there is a small `Box` shim so the
-env works without it.
+never loads a graphics stack — verified by installing an import hook that makes
+`panda3d`, `direct` and `PIL` raise, then running a full episode: it completes with
+zero graphics modules in `sys.modules`. Gymnasium is optional too — there is a small
+`Box` shim so the env works without it — but when it *is* installed,
+`gymnasium.utils.env_checker` passes with zero warnings, and `AsyncVectorEnv`,
+`RecordEpisodeStatistics` and `FrameStackObservation` are covered by
+`test_integration`.
 
 ## Observation
 
@@ -84,6 +102,13 @@ Turning lights off also disables
 the red-light penalty, because penalising a signal the agent cannot see is not a
 rule it can learn.
 
+Because those widths move, **never hard-code the block offsets** — read
+`env.obs_slices`, a name→slice mapping that is the single source of truth and the
+same numbers `main.py spec` prints. A switched-off block is present as an *empty*
+slice rather than missing, so `obs[sl["traffic"]]` is always valid. This is not
+hypothetical tidiness: the scripted baseline already mis-read the traffic-light
+block once by taking "the rest of the vector".
+
 There is no absolute position or heading anywhere in the observation, which is
 what lets a policy trained on one procedural layout transfer to the next instead
 of memorising coordinates.
@@ -113,9 +138,23 @@ waypoint reached, `−100` for a crash — into a building or a vehicle alike, w
 `info["crash_with"]` saying which — and `−50` for entering an intersection
 against a red.
 
-Early termination on "stuck" charges the *remaining* time penalty as a lump sum,
-so ending an episode early is reward-neutral. Otherwise stopping dead would be a
-cheap way to escape the per-step cost, and the agent would learn to park.
+Every step's reward is exactly `time + progress + waypoint + red-light + crash` and
+nothing else — reconstructed from `info` alone and checked against the env's own
+reward to a maximum residual of **7.1e-15**, over 18,363 steps per `test_integration`
+run and 59,254 steps in the wider audit that established it (172 waypoint hits, 86
+red-light violations, 85 crashes). Progress is potential-based, so it
+telescopes to net distance closed and there is no reward cycle in driving out and
+back. `tests/test_integration.py` keeps it that way.
+
+Early termination on "stuck" charges the *remaining* time penalty as a lump sum, so
+ending an episode early is **undiscounted**-return-neutral (verified: −100.0 either
+way). Otherwise stopping dead would be a cheap way to escape the per-step cost, and
+the agent would learn to park. The honest caveat is that under γ < 1 a lump sum paid
+now is worth more than the same penalties spread over 900 future steps, so
+discounted, getting stuck is strictly worse than crawling — deliberate shaping, and
+`stuck_steps=0` turns the detector off if it is in your way. It is reported as
+`terminated`, not `truncated`, precisely because the lump sum *replaces* the
+`V(s')` bootstrap; taking both would double-count the future.
 
 The red-light penalty fires **on entry only, never per step of occupancy**. A
 light that turns red while you are already in the box is not a violation, and
@@ -381,14 +420,35 @@ red-light hold and a closest-approach conflict test against moving traffic.
 the four call sites cannot disagree about it — which is how the traffic-light
 slice came to be mis-read once already.
 
-Over 300 pooled episodes of 3 waypoints each:
+Over 300 pooled episodes of 3 waypoints each, seeds 5000–5299:
 
-| task | dims | mean reward | waypoints | full route | red-light violations |
-|---|---|---|---|---|---|
-| random policy | 73 | −103 | 0.00 / 3 | 0% | — |
-| no traffic, no lights | 46 | **+219** | **1.86 / 3** | **45.3%** | — |
-| lights only | 53 | +149 | 1.71 / 3 | 35.0% | 0.80 |
-| traffic + lights (default) | 73 | +107 | 1.43 / 3 | 26.0% | 0.69 |
+| task | dims | mean reward | waypoints | full route | building / vehicle crashes | red-light violations |
+|---|---|---|---|---|---|---|
+| random policy | 73 | −103 | 0.00 / 3 | 0% | — | — |
+| no traffic, no lights | 46 | **+222** | **1.90 / 3** | **44.0%** | 156 / — | — |
+| lights only | 53 | +179 | 1.86 / 3 | 42.7% | 156 / — | 0.69 |
+| traffic only | 66 | +137 | 1.42 / 3 | 26.7% | 137 / 70 | — |
+| traffic + lights (default) | 73 | +129 | 1.58 / 3 | 31.3% | 131 / 60 | 0.61 |
+
+**The ablation is paired.** Every configuration draws from an independent per-subsystem
+random stream, so all four rows see the *same* 300 maps, spawn poses and waypoint
+sequences — switching lights off does not resample the city. A row difference is
+therefore a difference between the tasks, and the paired standard error on it is a
+fraction of the unpaired one:
+
+| vs no traffic, no lights | full route | mean reward |
+|---|---|---|
+| lights only | −1.3 pts ±1.6 | −42.3 ±5.4 |
+| traffic only | −17.3 pts ±2.4 | −84.9 ±10.1 |
+| traffic + lights | −12.7 pts ±2.4 | −92.6 ±9.5 |
+
+This is worth setting up deliberately, because unpaired it does not work. Before the
+streams were made independent, `traffic_lights=False` skipped one `permutation` draw
+and shifted every subsequent draw — the spawn, the waypoints, the next map — so the
+lights-off arm was scored on a *different* 300 episodes. The symptom was a lights-only
+arm that beat no lights at all, which is impossible, and that is what exposed the bug.
+Anyone running config ablations against this env gets the paired property for free;
+anyone reseeding by hand can lose it.
 
 Quote pooled runs, not blocks: full-route success is a per-episode Bernoulli, so a
 40-episode block has a ~7 point standard error and drifts enough to look like a
@@ -402,13 +462,34 @@ a red — it was paying ~1.7 violations per episode, about −84, for a manoeuvr
 was incapable of performing. A benchmark that a rule-following agent beats only
 by breaking rules is not measuring the task, so the red-light case now bypasses
 the floor, and so does the traffic conflict cap: queueing needs a genuine halt for
-exactly the same reason. Signals cost the baseline ~70 reward and 10 points of
-full-route success, so they are a real part of the task rather than a decoration.
+exactly the same reason.
+
+**Signals cost reward without costing route completion.** They take 42.3 ±5.4 off the
+mean return, but only 1.3 ±1.6 points of full-route success — a difference that does
+not clear its own error bar. That is the right shape for a rule: obeying it is a
+tax on the return, not a barrier to arriving. Almost all of the 42 is accounted for
+by 0.69 violations × 50 plus the time spent stopped, so a learner that stops
+correctly recovers most of it, and one that runs reds is paying for it visibly.
 
 **Traffic is a difficulty step this controller cannot be tuned through, and that is
-the finding.** Moving traffic costs it ~42 reward and 9 points of completed routes.
+the finding.** Moving traffic costs it 84.9 ±10.1 reward and 17.3 ±2.4 points of
+completed routes — an order of magnitude more completion cost than signals, on the
+same 300 episodes.
+
+The two interact, and not in the direction you would guess: *adding* signals to a
+traffic task **raises** completion, 26.7% → 31.3%, a paired +4.7 ±2.6 points, while
+leaving the return flat at −7.8 ±10.9. The mechanism is visible in the crash
+breakdown — vehicle crashes fall 70 → 60 — and it is the obvious one: a red light
+forces the baseline to stop at exactly the junctions where it would otherwise drive
+into cross traffic, so the rule buys collision avoidance the controller has no
+policy for. At 1.8 standard errors this is suggestive rather than established, and
+it is reported that way; what it does establish is that the two features are not
+independent difficulty knobs, so a paper quoting "the traffic task" needs to say
+which of the four configurations it means.
 Eight fixes were implemented and measured over 200-episode A/Bs; only the two that
-were *geometry bugs* helped, and they are now fixed in the env and the driver:
+were *geometry bugs* helped, and they are now fixed in the env and the driver. The
+absolute rates below predate the seeding fixes and so are not comparable with the
+table above — the A/B *contrasts* were each measured within one stream and stand:
 
 | attempt | result |
 |---|---|
@@ -425,8 +506,10 @@ The reason the four controller-side attempts all failed is that they were attack
 the wrong variable. The diagnostics say so plainly: the ego *sees* the vehicle it
 hits for a median of 66 steps beforehand, so it is not a sensing or occlusion
 failure; and the residual is dominated by **building** crashes, which sit at
-~145/300 in every configuration including no traffic at all. Traffic does not create
-a new failure mode so much as cut episodes short before the old one gets its chance.
+131–156 of 300 in every configuration including no traffic at all. Traffic does not
+create a new failure mode so much as cut episodes short before the old one gets its
+chance — the building-crash count actually *falls* when traffic is added (156 → 137),
+because episodes end sooner.
 A controller with no concept of a lane, of right of way, or of another driver's
 intent has a ceiling here, and that ceiling is exactly the headroom a learned
 policy is supposed to claim.
@@ -453,12 +536,23 @@ Two lessons from tuning it that apply to reward shaping generally:
 ## Tests
 
 ```
-python tests/test_core.py     # city, ray casters vs brute force, car model, OBB
-python tests/test_env.py      # obs contract, determinism, reward, baseline vs random
-python tests/test_render.py   # image obs, render determinism, overlay, cost
-python tests/diagnose.py      # single-episode step trace + ASCII trajectory map
-python tests/diagnose_crash.py# last 14 steps before each crash, failure-mode tally
+python tests/test_core.py        # city, ray casters vs brute force, car model, OBB
+python tests/test_env.py         # obs contract, determinism, reward, baseline vs random
+python tests/test_render.py      # image obs, render determinism, overlay, cost
+python tests/test_integration.py # the contract an outside learner depends on
+python tests/diagnose.py         # single-episode step trace + ASCII trajectory map
+python tests/diagnose_crash.py   # last 14 steps before each crash, failure-mode tally
 ```
+
+`test_integration` covers the seam an algorithm actually sits on, which the other
+three do not: seeding, reward decomposition, `terminated` vs `truncated`, whether
+the objects handed out survive a replay buffer or a worker process, and gymnasium
+conformance. **Every check in it was written against a real defect** — the headline
+one being a `reset(seed=s)` that reseeded the city and the LIDAR but not the traffic,
+so calling it twice on one env gave two different episodes. `test_env`'s determinism
+check missed that because it built a fresh env per rollout, which is not how a
+training loop is written. Its gymnasium section prints a visible `[SKIP]`
+rather than passing quietly when gymnasium is absent.
 
 The two `diagnose` scripts earned their place: every controller bug listed above
 was found by dumping state before a crash, not by reasoning about the code.
