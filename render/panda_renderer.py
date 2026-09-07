@@ -207,7 +207,7 @@ class PandaRenderer:
             model.reparentTo(self.car_np)
             # The Kenney sedan faces +Y after glTF load; our world forward is +X.
             # setH(-90) on the sub-node rotates the nose from +Y to +X.
-            model.setH(90)
+            model.setH(-90)
             # Sedan bounding box: Y=2.55 m long.  Scale so length ≈ 4.4 m.
             model.setScale(1.72)
         else:
@@ -344,30 +344,27 @@ class PandaRenderer:
         fwd_z = -np.sin(car.heading)
         lft_x, lft_z = -fwd_z, fwd_x      # CCW 90° of forward
 
+        sz = 0.020
         segs = LineSegs()
 
-        # Proximity ring — radius = nearest LIDAR hit, colour: green (clear) → red (close).
+        # Proximity ring — fixed size around the car icon, colour only changes.
+        # Green = clear, red = imminent collision.
         lidar = getattr(env, "lidar", None)
         if lidar is not None and hasattr(lidar, "last_distances"):
             min_dist = float(np.min(lidar.last_distances))
             t = np.clip(min_dist / lidar.max_range, 0.0, 1.0)
-            ex, _ = self._mm_extent
-            scale = (self._MM_X1 - self._MM_X0) / ex
-            radius = min(min_dist * scale, (self._MM_X1 - self._MM_X0) * 0.42)
+            ring_r = sz * 2.2   # fixed, just outside the car triangle
             segs.setThickness(2.0)
             segs.setColor(1.0 - t, t, 0.05, 0.85)
             N = 32
             for i in range(N + 1):
                 a = 2.0 * np.pi * i / N
-                px = cx + np.cos(a) * radius
-                pz = cz + np.sin(a) * radius
                 if i == 0:
-                    segs.moveTo(px, 0, pz)
+                    segs.moveTo(cx + np.cos(a) * ring_r, 0, cz + np.sin(a) * ring_r)
                 else:
-                    segs.drawTo(px, 0, pz)
+                    segs.drawTo(cx + np.cos(a) * ring_r, 0, cz + np.sin(a) * ring_r)
 
         # Car as a filled triangle: tip forward, base behind.
-        sz = 0.020
         tip_x = cx + fwd_x * sz
         tip_z = cz + fwd_z * sz
         bl_x = cx - fwd_x * sz * 0.6 + lft_x * sz * 0.6
