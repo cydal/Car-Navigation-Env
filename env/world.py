@@ -102,20 +102,37 @@ class ProceduralCity:
         self.intersections = self._find_intersections(grid, v_roads, h_roads)
 
     def _find_intersections(self, grid, v_roads, h_roads):
-        """Return world-space (x, y) centres where v_road and h_road corridors cross."""
+        """Return world-space (x, y) centres of true 4-way road crossings.
+
+        A crossing qualifies only when all four arms (N, S, W, E) have at least
+        one open road tile just beyond the crossing boundary.  Segments walled
+        off by _block_segments turn those crossings into T- or dead-end junctions
+        that don't warrant a traffic light.
+        """
         cfg = self.cfg
         ts = cfg.tile_size
         rw = cfg.road_width
+        h, w = grid.shape
         result = []
         for vx in v_roads:
             for hy in h_roads:
                 cr = hy + rw // 2
                 cc = vx + rw // 2
-                if 0 <= cr < cfg.height and 0 <= cc < cfg.width and grid[cr, cc] == ROAD:
-                    result.append((
-                        float((vx + rw / 2) * ts),
-                        float((hy + rw / 2) * ts),
-                    ))
+                if not (0 <= cr < h and 0 <= cc < w and grid[cr, cc] == ROAD):
+                    continue
+                arms = [
+                    (hy - 1,  cc),      # north arm (smaller row = less physics y)
+                    (hy + rw, cc),      # south arm
+                    (cr,  vx - 1),      # west arm
+                    (cr,  vx + rw),     # east arm
+                ]
+                if not all(0 <= r < h and 0 <= c < w and grid[r, c] == ROAD
+                           for r, c in arms):
+                    continue
+                result.append((
+                    float((vx + rw / 2) * ts),
+                    float((hy + rw / 2) * ts),
+                ))
         return result
 
     def _road_positions(self, extent):

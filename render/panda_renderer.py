@@ -398,7 +398,17 @@ class PandaRenderer:
     # ------------------------------------------------------------------
 
     def _setup_traffic_lights(self, city):
-        """Create post + housing + 3 lamp NodePaths for every intersection."""
+        """One pole per 4-way intersection with two direction-specific signal heads.
+
+        Each pole sits in the NW corner of the crossing.  A horizontal arm extends
+        east (+X in Panda, for N-S traffic) and another extends south (-Y, for E-W
+        traffic).  A signal plate hangs at each arm end.
+
+        Lamp visibility fix: lamps are *wider* than the plate in the perpendicular
+        direction so their side-faces protrude past the plate and are visible from
+        any horizontal angle.  The NS head shows the NS phase; the EW head shows
+        the EW phase independently.
+        """
         for static_np, lamp_nps in self._tl_nps:
             static_np.removeNode()
             for ln in lamp_nps:
@@ -409,62 +419,101 @@ class PandaRenderer:
         if not city.intersections:
             return
 
-        half_road = (city.cfg.road_width / 2.0) * city.tile_size  # e.g. 6.0 m
-        inset = 1.0   # metres inside the crossing corner
+        half_road = (city.cfg.road_width / 2.0) * city.tile_size
+        inset = 1.2
 
-        POST_W, POST_H = 0.24, 4.2
-        HOUS_W, HOUS_H = 0.46, 1.6
-        LAMP_W, LAMP_H = 0.28, 0.36
+        POST_W   = 0.20
+        POST_H   = 4.2
+        ARM_L    = 0.35
+        PLATE_D  = 0.08   # plate depth in the face direction
+        PLATE_W  = 0.36   # plate width perpendicular to face
+        LAMP_H   = 0.28
+        LAMP_W   = 0.26   # half-width; total 0.52 > plate 0.36 → protrudes 8 cm per side
+        LAMP_GAP = 0.08
+        LAMP_Z_OFF = 0.07
+        PLATE_H  = 3 * LAMP_H + 2 * LAMP_GAP + 2 * LAMP_Z_OFF   # ≈ 1.14 m
+
         POST_COL  = (0.16, 0.16, 0.16, 1)
-        HOUSE_COL = (0.10, 0.10, 0.10, 1)
-        # dim colours for inactive lamps (red, yellow, green)
+        ARM_COL   = (0.20, 0.20, 0.20, 1)
+        PLATE_COL = (0.09, 0.09, 0.09, 1)
         DIM = [(0.22, 0.04, 0.04, 1), (0.22, 0.18, 0.04, 1), (0.04, 0.22, 0.04, 1)]
 
+        hw  = POST_W / 2
+        pz0 = POST_H - PLATE_H   # bottom of signal plates
+
         for cx, cy in city.intersections:
-            # NW corner of crossing in Panda (Y-mirrored) space
             pan_x = cx - half_road + inset
             pan_y = -cy + half_road - inset
 
-            hw = POST_W / 2
-            static_verts = np.concatenate([
+            static_parts = [
                 _box_mesh((pan_x - hw, pan_y - hw, 0.0),
                           (pan_x + hw, pan_y + hw, POST_H), POST_COL),
-                _box_mesh((pan_x - HOUS_W / 2, pan_y - HOUS_W / 2, POST_H),
-                          (pan_x + HOUS_W / 2, pan_y + HOUS_W / 2, POST_H + HOUS_H), HOUSE_COL),
-            ])
-            static_np = _mesh_to_node("tl_static", static_verts)
+            ]
+
+            # NS arm extends east (+X), plate faces +X
+            ns_ax1 = pan_x + hw + ARM_L
+            static_parts += [
+                _box_mesh((pan_x + hw, pan_y - 0.05, POST_H - 0.12),
+                          (ns_ax1,    pan_y + 0.05, POST_H), ARM_COL),
+                _box_mesh((ns_ax1,            pan_y - PLATE_W / 2, pz0),
+                          (ns_ax1 + PLATE_D,  pan_y + PLATE_W / 2, POST_H), PLATE_COL),
+            ]
+            ns_px = ns_ax1   # lamp reference: plate back face
+
+            # EW arm extends south (-Y), plate faces -Y
+            ew_ay0 = pan_y - hw - ARM_L
+            static_parts += [
+                _box_mesh((pan_x - 0.05, ew_ay0,    POST_H - 0.12),
+                          (pan_x + 0.05, pan_y - hw, POST_H), ARM_COL),
+                _box_mesh((pan_x - PLATE_W / 2, ew_ay0 - PLATE_D, pz0),
+                          (pan_x + PLATE_W / 2, ew_ay0,            POST_H), PLATE_COL),
+            ]
+            ew_py = ew_ay0   # lamp reference: plate front face (most-negative Y)
+
+            static_np = _mesh_to_node("tl_static", np.concatenate(static_parts))
             static_np.reparentTo(self.base.render)
 
-            # Lamps: index 0=red (top), 1=yellow (middle), 2=green (bottom)
-            lamp_nps = []
-            lw = LAMP_W / 2
-            for j in range(3):
-                lz0 = POST_H + 0.12 + (2 - j) * (LAMP_H + 0.06)
-                lamp_verts = _box_mesh(
-                    (pan_x - lw, pan_y - lw, lz0),
-                    (pan_x + lw, pan_y + lw, lz0 + LAMP_H),
-                    DIM[j])
-                ln = _mesh_to_node(f"tl_lamp_{j}", lamp_verts)
-                ln.reparentTo(self.base.render)
-                ln.setLightOff()
-                lamp_nps.append(ln)
+            ns_lamps, ew_lamps = [], []
+            for j in range(3):   # j=0 red (top), j=1 yellow (mid), j=2 green (bottom)
+                lz0 = pz0 + LAMP_Z_OFF + (2 - j) * (LAMP_H + LAMP_GAP)
 
-            self._tl_nps.append((static_np, lamp_nps))
-            self._tl_lamp_nps.append(lamp_nps)
+                # NS lamp: same X depth as plate, wider in Y → side-faces protrude
+                ns_verts = _box_mesh(
+                    (ns_px,           pan_y - LAMP_W, lz0),
+                    (ns_px + PLATE_D, pan_y + LAMP_W, lz0 + LAMP_H), DIM[j])
+                ns_ln = _mesh_to_node(f"tl_ns{j}", ns_verts)
+                ns_ln.reparentTo(self.base.render)
+                ns_ln.setLightOff()
+                ns_lamps.append(ns_ln)
 
-    # Bright colours for active lamps (red, yellow, green)
+                # EW lamp: same Y depth as plate, wider in X → side-faces protrude
+                ew_verts = _box_mesh(
+                    (pan_x - LAMP_W, ew_py - PLATE_D, lz0),
+                    (pan_x + LAMP_W, ew_py,           lz0 + LAMP_H), DIM[j])
+                ew_ln = _mesh_to_node(f"tl_ew{j}", ew_verts)
+                ew_ln.reparentTo(self.base.render)
+                ew_ln.setLightOff()
+                ew_lamps.append(ew_ln)
+
+            self._tl_nps.append((static_np, ns_lamps + ew_lamps))
+            self._tl_lamp_nps.append((ns_lamps, ew_lamps))
+
+    # Bright / dim colours: index 0=red, 1=yellow, 2=green
     _TL_ON  = [(1.00, 0.06, 0.04, 1), (1.00, 0.88, 0.04, 1), (0.08, 1.00, 0.08, 1)]
     _TL_OFF = [(0.22, 0.04, 0.04, 1), (0.22, 0.18, 0.04, 1), (0.04, 0.22, 0.04, 1)]
 
     def _update_traffic_lights(self, env):
         tls = getattr(env, 'traffic_lights', [])
-        for tl, lamp_nps in zip(tls, self._tl_lamp_nps):
-            state = tl.ns_state
-            for j, (on_col, off_col) in enumerate(zip(self._TL_ON, self._TL_OFF)):
-                active = (j == 0 and state == 'red') or \
-                         (j == 1 and state == 'yellow') or \
-                         (j == 2 and state == 'green')
-                lamp_nps[j].setColor(*(on_col if active else off_col))
+        for tl, (ns_lamps, ew_lamps) in zip(tls, self._tl_lamp_nps):
+            for j, (on, off) in enumerate(zip(self._TL_ON, self._TL_OFF)):
+                ns_active = (j == 0 and tl.ns_state == 'red')    or \
+                            (j == 1 and tl.ns_state == 'yellow') or \
+                            (j == 2 and tl.ns_state == 'green')
+                ew_active = (j == 0 and tl.ew_state == 'red')    or \
+                            (j == 1 and tl.ew_state == 'yellow') or \
+                            (j == 2 and tl.ew_state == 'green')
+                ns_lamps[j].setColor(*(on if ns_active else off))
+                ew_lamps[j].setColor(*(on if ew_active else off))
 
     # ------------------------------------------------------------------
     def build_scene(self, city):

@@ -105,6 +105,10 @@ class EnvConfig:
         target_bonus=100.0,
         stuck_speed=0.5,
         stuck_steps=150,
+        red_light_penalty=50.0,
+        # --- traffic-light observation (0 = off, keeps the default 46-dim vector)
+        n_tl_obs=0,
+        tl_obs_range=60.0,
     ):
         self.n_targets = n_targets              # waypoints per episode
         self.n_lookahead = n_lookahead          # waypoints exposed in the observation
@@ -125,6 +129,9 @@ class EnvConfig:
         self.target_bonus = target_bonus
         self.stuck_speed = stuck_speed
         self.stuck_steps = stuck_steps
+        self.red_light_penalty = red_light_penalty
+        self.n_tl_obs = n_tl_obs                # nearest TLs in obs; 0 = off
+        self.tl_obs_range = tl_obs_range
 
 
 class CarNavEnv(_BaseEnv):
@@ -182,10 +189,13 @@ class CarNavEnv(_BaseEnv):
         self.stuck_count = 0
         self.last_action = np.zeros(3, dtype=np.float32)
         self.terminated_reason = None
+        self._in_intersection = set()   # indices of TLs the car is currently inside
+        self.red_light_violations = 0
 
         # --- spaces
         self.action_space = _box(-1.0, 1.0, (3,))
-        self.vector_dim = self.cfg.n_beams + 5 + 3 * self.cfg.n_lookahead
+        self.vector_dim = (self.cfg.n_beams + 5 + 3 * self.cfg.n_lookahead
+                           + 6 * self.cfg.n_tl_obs)
         vec_space = _box(-1.0, 1.0, (self.vector_dim,))
         img_space = _box(0, 255, (image_size, image_size, 3), np.uint8)
         if obs_type == "vector":
@@ -226,6 +236,8 @@ class CarNavEnv(_BaseEnv):
         self.stuck_count = 0
         self.last_action = np.zeros(3, dtype=np.float32)
         self.terminated_reason = None
+        self._in_intersection = set()
+        self.red_light_violations = 0
         self.prev_dist = self._dist_to_target()
 
         if self._renderer is not None:
@@ -284,6 +296,26 @@ class CarNavEnv(_BaseEnv):
                     break
                 self.prev_dist = self._dist_to_target()
 
+        # Red-light violation: one-shot penalty when the car enters an intersection
+        # zone while the relevant signal is red.  Checked before ticking so the car
+        # experiences the phase it sees this step, not the next one.
+        if not terminated and self.traffic_lights:
+            half_road = (self.city.cfg.road_width / 2.0) * self.city.tile_size
+            h = self.car.heading
+            ns_direction = abs(np.sin(h)) > abs(np.cos(h))
+            for i, tl in enumerate(self.traffic_lights):
+                in_zone = (abs(self.car.x - tl.x) < half_road and
+                           abs(self.car.y - tl.y) < half_road)
+                if in_zone and i not in self._in_intersection:
+                    state = tl.ns_state if ns_direction else tl.ew_state
+                    if state == 'red':
+                        reward -= cfg.red_light_penalty
+                        self.red_light_violations += 1
+                if in_zone:
+                    self._in_intersection.add(i)
+                else:
+                    self._in_intersection.discard(i)
+
         self.step_count += 1
         for tl in self.traffic_lights:
             tl.tick()
@@ -307,6 +339,7 @@ class CarNavEnv(_BaseEnv):
         info = self._info()
         info["crashed"] = crashed
         info["targets_reached_this_step"] = reached
+        info["red_light_violations"] = self.red_light_violations
         return self._observe(), float(reward), bool(terminated), bool(truncated), info
 
     # ------------------------------------------------------------------
@@ -323,7 +356,55 @@ class CarNavEnv(_BaseEnv):
         dyn = dynamics_features(self.car)
         nav = nav_features(self.car, self.targets, self.target_idx,
                            self.cfg.n_lookahead, self.cfg.nav_range)
-        return np.concatenate([scan, dyn, nav]).astype(np.float32)
+        return np.concatenate([scan, dyn, nav, self._tl_features()]).astype(np.float32)
+
+    def _tl_features(self):
+        """Encode the n_tl_obs nearest traffic lights into the observation vector.
+
+        Per light (6 values, all in [-1, 1] or [0, 1]):
+            dist_norm   normalised distance (0 = at light, 1 = at/beyond tl_obs_range)
+            sin_bearing ego-centric bearing to the intersection
+            cos_bearing
+            red         1 if the relevant signal is red, else 0
+            yellow      1 if yellow
+            green       1 if green
+
+        The relevant signal is NS if |sin(heading)| > |cos(heading)|, else EW.
+        Absent / out-of-range lights are padded with (1, 0, 0, 0, 0, 1) — far, green.
+        """
+        n = self.cfg.n_tl_obs
+        if n == 0 or not self.traffic_lights:
+            return np.zeros(6 * n, dtype=np.float32)
+
+        car = self.car
+        r = self.cfg.tl_obs_range
+        ns_dir = abs(np.sin(car.heading)) > abs(np.cos(car.heading))
+
+        ranked = sorted(
+            self.traffic_lights,
+            key=lambda tl: (tl.x - car.x) ** 2 + (tl.y - car.y) ** 2
+        )
+
+        out = []
+        for k in range(n):
+            if k < len(ranked):
+                tl = ranked[k]
+                dist = float(np.hypot(tl.x - car.x, tl.y - car.y))
+                if dist < r:
+                    bearing = np.arctan2(tl.y - car.y, tl.x - car.x) - car.heading
+                    state = tl.ns_state if ns_dir else tl.ew_state
+                    out += [
+                        float(dist / r),
+                        float(np.sin(bearing)),
+                        float(np.cos(bearing)),
+                        float(state == 'red'),
+                        float(state == 'yellow'),
+                        float(state == 'green'),
+                    ]
+                    continue
+            out += [1.0, 0.0, 0.0, 0.0, 0.0, 1.0]   # pad: far, green
+
+        return np.array(out, dtype=np.float32)
 
     def image_obs(self):
         if self._renderer is None:
@@ -365,6 +446,7 @@ class CarNavEnv(_BaseEnv):
             "episode_reward": self.episode_reward,
             "reason": self.terminated_reason,
             "is_success": self.terminated_reason == "success",
+            "red_light_violations": self.red_light_violations,
         }
 
     # ------------------------------------------------------------------
