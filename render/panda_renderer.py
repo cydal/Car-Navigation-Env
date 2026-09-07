@@ -464,15 +464,20 @@ class PandaRenderer:
     def _place_camera(self, env):
         car = env.car
         fx, fy = np.cos(car.heading), np.sin(car.heading)
+        # The 3D scene uses physics (x, y) coordinates directly, but Panda3D's
+        # right-hand Z-up system has the opposite Y-chirality from the physics
+        # world (where Y increases "south"/screen-down).  With setH(-degrees) on
+        # the car mesh, the nose faces (cos h, -sin h) in world space.  Place the
+        # camera behind that direction (+sin offset) and look forward (-sin offset).
         want = Vec3(car.x - fx * self.cam_dist,
-                    car.y - fy * self.cam_dist,
+                    car.y + fy * self.cam_dist,
                     self.cam_height)
         if self.smooth > 0.0 and self._cam_pos is not None:
             want = self._cam_pos * self.smooth + want * (1.0 - self.smooth)
         self._cam_pos = want
         self.base.camera.setPos(want)
         self.base.camera.lookAt(car.x + fx * self.look_ahead,
-                                car.y + fy * self.look_ahead, 1.2)
+                                car.y - fy * self.look_ahead, 1.2)
 
     def _place_actors(self, env):
         car = env.car
