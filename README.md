@@ -106,15 +106,15 @@ are warm grey, road is dark blue-grey.  Elements:
 | orange triangle | car — tip = nose, tail = rear |
 | bright green square | current target waypoint |
 | yellow squares | upcoming waypoints (in order) |
-| coloured ring | proximity indicator — radius = nearest LIDAR hit; **green** = plenty of clearance, **red** = very close |
 
-The proximity ring gives an at-a-glance danger signal without cluttering the map
-with 32 individual ray lines.  Those are kept available for future use (e.g.
-visualising a world model's imagined scene in a separate overlay).
-
-**LIDAR overlay (3D, optional)** — set `show_rays=True` when constructing
-`PandaRenderer` to draw the 32-beam scan fan in the 3D scene.  Off by default
-so it does not appear in image observations.
+**Proximity ring (3D, default on in windowed mode)** — a ring of radius 3 m
+around the car in the 3D scene.  Each segment is coloured by the LIDAR
+distance in that direction: **green** = clear, **red** = obstacle close.
+This gives an at-a-glance danger signal without cluttering the minimap.
+The LIDAR ray lines are reserved for future use (e.g. visualising a world
+model's imagined scene in a separate overlay).  Set `show_rays=False` to
+suppress the ring; it is off by default in offscreen (training) mode so it
+never enters image observations.
 
 **Keyboard controls** (`--keys` flag):
 

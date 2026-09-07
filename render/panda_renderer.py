@@ -202,7 +202,7 @@ class PandaRenderer:
 
         _here = os.path.dirname(os.path.abspath(__file__))
         glb = os.path.normpath(os.path.join(
-            _here, "..", "kenney_car-kit", "Models", "GLB format", "sedan.glb"))
+            _here, "..", "kenney_car-kit", "Models", "GLB format", "race.glb"))
 
         if os.path.exists(glb):
             model = self.base.loader.loadModel(glb)
@@ -349,23 +349,6 @@ class PandaRenderer:
         sz = 0.020
         segs = LineSegs()
 
-        # Proximity ring — fixed size around the car icon, colour only changes.
-        # Green = clear, red = imminent collision.
-        lidar = getattr(env, "lidar", None)
-        if lidar is not None and hasattr(lidar, "last_distances"):
-            min_dist = float(np.min(lidar.last_distances))
-            t = np.clip(min_dist / lidar.max_range, 0.0, 1.0)
-            ring_r = sz * 2.2   # fixed, just outside the car triangle
-            segs.setThickness(2.0)
-            segs.setColor(1.0 - t, t, 0.05, 0.85)
-            N = 32
-            for i in range(N + 1):
-                a = 2.0 * np.pi * i / N
-                if i == 0:
-                    segs.moveTo(cx + np.cos(a) * ring_r, 0, cz + np.sin(a) * ring_r)
-                else:
-                    segs.drawTo(cx + np.cos(a) * ring_r, 0, cz + np.sin(a) * ring_r)
-
         # Car as a filled triangle: tip forward, base behind.
         tip_x = cx + fwd_x * sz
         tip_z = cz + fwd_z * sz
@@ -494,7 +477,7 @@ class PandaRenderer:
     def _place_actors(self, env):
         car = env.car
         self.car_np.setPos(car.x, car.y, 0.0)
-        self.car_np.setH(np.degrees(car.heading))
+        self.car_np.setH(-np.degrees(car.heading))
 
         # Only show waypoints still to be visited, brightest first.
         pending = env.targets[env.target_idx:]
@@ -509,10 +492,11 @@ class PandaRenderer:
                 np_.hide()
 
     def _draw_rays(self, env):
-        """Proximity ring in the 3D scene.  Green = clear, red = close.
+        """Per-direction proximity ring in the 3D scene.
 
-        Always clears first so a stale ring never stays frozen when the
-        overlay is switched off between frames.
+        Each segment is coloured by the LIDAR distance in that direction:
+        green = clear, red = obstacle close.  Always clears first so a stale
+        ring never stays frozen when the overlay is switched off.
         """
         if self._rays_np is not None:
             self._rays_np.removeNode()
@@ -520,21 +504,34 @@ class PandaRenderer:
         lidar = getattr(env, "lidar", None)
         if not self.show_rays or lidar is None:
             return
-        min_dist = float(np.min(lidar.last_distances))
-        t = np.clip(min_dist / lidar.max_range, 0.0, 1.0)
-        segs = LineSegs()
-        segs.setThickness(2.5)
-        segs.setColor(1.0 - t, t, 0.05, 0.9)
-        radius = 3.0   # world metres, outside the car body
-        N = 48
+
+        dists = lidar.last_distances        # (n_beams,) raw metres
+        n_beams = len(dists)
+        max_r = float(lidar.max_range)
+        heading = float(env.car.heading)
         cx, cy = env.car.x, env.car.y
+
+        segs = LineSegs()
+        segs.setThickness(3.0)
+        radius = 3.0   # metres, just outside the car body
+
+        # Draw N ring vertices; each vertex looks up the nearest LIDAR beam.
+        # Beam k sits at world angle (heading + π + 2π·k/n_beams):
+        #   k=0 → heading+π (rear), k=n/2 → heading (front).
+        N = 64
         for i in range(N + 1):
             a = 2.0 * np.pi * i / N
-            px, py = cx + np.cos(a) * radius, cy + np.sin(a) * radius
+            rel = (a - heading - np.pi) % (2.0 * np.pi)
+            k = int(round(rel * n_beams / (2.0 * np.pi))) % n_beams
+            t = float(np.clip(dists[k] / max_r, 0.0, 1.0))
+            segs.setColor(1.0 - t, t, 0.05, 0.9)
+            px = cx + np.cos(a) * radius
+            py = cy + np.sin(a) * radius
             if i == 0:
                 segs.moveTo(px, py, 0.5)
             else:
                 segs.drawTo(px, py, 0.5)
+
         self._rays_np = self.base.render.attachNewNode(segs.create())
         self._rays_np.setLightOff()
 
