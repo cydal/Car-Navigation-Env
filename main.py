@@ -31,10 +31,7 @@ def build_env(args, obs_type, renderer=None, image_size=64):
 
 
 def make_driver(env):
-    p = env.car.p
-    return GapFollower(n_beams=env.cfg.n_beams, n_lookahead=env.cfg.n_lookahead,
-                       lidar_range=env.cfg.lidar_range, max_speed=p.max_speed,
-                       car_length=p.length, car_width=p.width, wheelbase=p.wheelbase)
+    return GapFollower.for_env(env)
 
 
 # ----------------------------------------------------------------------

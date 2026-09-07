@@ -60,7 +60,7 @@ for _ in range(40):
 print(f"steer=-1 from heading 0: pos=({car.x:.1f},{car.y:.1f}) heading={np.degrees(car.heading):.1f} deg")
 
 # Does the controller steer toward a target that is to the car's right/down?
-drv = GapFollower()
+drv = GapFollower(n_tl_obs=0, n_traffic_obs=0)   # bare 46-D nav probe
 n = 32
 for label, bearing in (("target dead ahead", 0.0), ("target 45 deg right/down", np.radians(45)),
                        ("target 45 deg left/up", np.radians(-45)), ("target behind", np.pi)):
@@ -82,7 +82,7 @@ cfg = EnvConfig()
 env = CarNavEnv(config=cfg, city_config=CityConfig(width=48, height=48, tile_size=4.0),
                 obs_type="vector", seed=99)
 obs, info = env.reset(seed=1000)
-drv = GapFollower(n_beams=cfg.n_beams, lidar_range=cfg.lidar_range, max_speed=env.car.p.max_speed)
+drv = GapFollower.for_env(env)
 ts = env.city.tile_size
 path = [(env.car.x, env.car.y)]
 

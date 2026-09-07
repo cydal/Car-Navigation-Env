@@ -161,6 +161,12 @@ class PandaRenderer:
         self._cam_pos = None          # only used when smooth > 0
         self._tl_nps = []             # [(static_np, [r_np, y_np, g_np]), ...]
         self._tl_lamp_nps = []        # [[r_np, y_np, g_np], ...] — parallel to city.intersections
+        # Vehicle meshes are loaded once per model and *instanced* per vehicle.
+        # Reloading a .glb for each of ~26 vehicles on every reset would cost more
+        # than the whole city mesh does.
+        self._veh_protos = {}         # kind index -> prototype NodePath (detached)
+        self._veh_root = None         # NodePath holding one instance per vehicle
+        self._veh_nps = []
         self._setup_lights()
         self._setup_actors()
 
@@ -534,7 +540,70 @@ class PandaRenderer:
                             *(self._TL_ON[j] if state == name else self._TL_OFF[j]))
 
     # ------------------------------------------------------------------
-    def build_scene(self, city):
+    # Traffic
+    # ------------------------------------------------------------------
+    def _vehicle_proto(self, kind):
+        """Load and cache one vehicle mesh, scaled so it matches its footprint.
+
+        The physics footprint is authoritative: each mesh is measured after load
+        and scaled to the length the simulation uses, rather than the simulation
+        adopting whatever size the artist happened to model. Otherwise LIDAR would
+        report one car and the picture would show another.
+        """
+        if kind in self._veh_protos:
+            return self._veh_protos[kind]
+
+        import os
+        from env.traffic import VEHICLE_KINDS
+        stem, length, width = VEHICLE_KINDS[kind]
+        _here = os.path.dirname(os.path.abspath(__file__))
+        glb = os.path.normpath(os.path.join(
+            _here, "..", "kenney_car-kit", "Models", "GLB format", f"{stem}.glb"))
+
+        holder = NodePath(f"veh_proto_{stem}")
+        if os.path.exists(glb):
+            model = self.base.loader.loadModel(glb)
+            lo, hi = model.getTightBounds()
+            raw = float(hi[1] - lo[1])            # Kenney models face +Y on load
+            model.reparentTo(holder)
+            model.setH(90)                        # nose from +Y to our +X
+            if raw > 1e-3:
+                holder.setScale(length / raw)
+        else:                                     # keep working without the asset pack
+            _mesh_to_node(f"veh_box_{stem}", _box_mesh(
+                (-length / 2, -width / 2, 0.0), (length / 2, width / 2, 1.35),
+                (0.55, 0.57, 0.62, 1))).reparentTo(holder)
+
+        self._veh_protos[kind] = holder
+        return holder
+
+    def _setup_traffic(self, traffic):
+        """Create one instanced node per vehicle for this episode."""
+        if self._veh_root is not None:
+            self._veh_root.removeNode()
+            self._veh_root = None
+        self._veh_nps = []
+        if traffic is None or len(getattr(traffic, "kind", ())) == 0:
+            return
+
+        self._veh_root = self.base.render.attachNewNode("traffic")
+        for i, kind in enumerate(traffic.kind):
+            np_ = self._veh_root.attachNewNode(f"veh{i}")
+            self._vehicle_proto(int(kind)).instanceTo(np_)
+            self._veh_nps.append(np_)
+
+    def _update_traffic(self, env):
+        traffic = getattr(env, "traffic", None)
+        if traffic is None:
+            return
+        for i, np_ in enumerate(self._veh_nps):
+            if i >= len(traffic.x):
+                break
+            np_.setPos(float(traffic.x[i]), -float(traffic.y[i]), 0.0)  # Y-mirrored
+            np_.setH(-np.degrees(float(traffic.heading[i])))
+
+    # ------------------------------------------------------------------
+    def build_scene(self, city, traffic=None):
         """(Re)build the city mesh. Called on every reset, so it must be quick."""
         if self._city_np is not None:
             self._city_np.removeNode()
@@ -651,6 +720,7 @@ class PandaRenderer:
         self._cam_pos = None
 
         self._setup_traffic_lights(city)
+        self._setup_traffic(traffic)
 
         if self.show_minimap and self._mm_city_tex is not None:
             self._build_minimap_texture(city)
@@ -739,11 +809,12 @@ class PandaRenderer:
         own render loop instead of us calling renderFrame by hand.
         """
         if self._city_np is None:
-            self.build_scene(env.city)
+            self.build_scene(env.city, getattr(env, "traffic", None))
         self._place_camera(env)
         self._place_actors(env)
         self._draw_rays(env)
         self._update_traffic_lights(env)
+        self._update_traffic(env)
         if self.show_minimap:
             self._update_minimap(env)
 
@@ -783,6 +854,10 @@ class PandaRenderer:
                 ln.removeNode()
         self._tl_nps = []
         self._tl_lamp_nps = []
+        if self._veh_root is not None:
+            self._veh_root.removeNode()
+            self._veh_root = None
+        self._veh_nps = []
         if self._mm_np is not None:
             self._mm_np.removeNode()
             self._mm_np = None

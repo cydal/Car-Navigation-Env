@@ -153,9 +153,7 @@ print("=" * 62)
 print("Validates the task is solvable AND that the vector obs alone suffices.\n")
 env = make_env(seed=99)
 p = env.car.p
-driver = GapFollower(n_beams=env.cfg.n_beams, n_lookahead=env.cfg.n_lookahead,
-                     lidar_range=env.cfg.lidar_range, max_speed=p.max_speed,
-                     car_length=p.length, car_width=p.width, wheelbase=p.wheelbase)
+driver = GapFollower.for_env(env)
 
 EPISODES = 40
 reasons, rewards, reached, steps, speeds = {}, [], [], [], []

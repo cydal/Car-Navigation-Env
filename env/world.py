@@ -69,6 +69,9 @@ class ProceduralCity:
         self.road_cells = None      # (N, 2) array of (row, col) reachable road tiles
         self.intersections = []     # (x, y) world-space centres of every 4-way crossing
         self.signals = []           # the sparse subset of those that get traffic lights
+        self.road_nodes = None      # (K, 2) corridor centre-line crossings, incl. T-junctions
+        self.node_links = None      # (K, 4) neighbour node ids per direction, -1 = none
+        self.parking_spots = None   # (M, 3) candidate kerbside (x, y, heading)
         self.generate()
 
     # ------------------------------------------------------------------
@@ -100,17 +103,25 @@ class ProceduralCity:
             cells = self._keep_largest_component(grid)
             # Reject degenerate maps (a couple of stub streets is not a city).
             if len(cells) >= 0.05 * cfg.width * cfg.height:
-                self.grid = grid
-                self.road_cells = cells
-                self.intersections = self._find_intersections(grid, v_roads, h_roads)
-                self.signals = self._choose_signals(self.intersections)
+                self._commit(grid, cells, v_roads, h_roads)
                 return
 
         # Fall back to whatever the last attempt produced rather than looping forever.
+        self._commit(grid, cells, v_roads, h_roads)
+
+    def _commit(self, grid, cells, v_roads, h_roads):
+        """Adopt a generated layout and derive everything downstream from it.
+
+        Order matters: `_keep_largest_component` has already walled off the
+        unreachable parts, and the road graph and parking slots must see that
+        final grid or traffic would be routed down a street that no longer exists.
+        """
         self.grid = grid
         self.road_cells = cells
         self.intersections = self._find_intersections(grid, v_roads, h_roads)
         self.signals = self._choose_signals(self.intersections)
+        self.road_nodes, self.node_links = self._build_road_graph(grid, v_roads, h_roads)
+        self.parking_spots = self._parking_spots(grid, self.road_nodes)
 
     def _find_intersections(self, grid, v_roads, h_roads):
         """Return world-space (x, y) centres of true 4-way road crossings.
@@ -165,6 +176,126 @@ class ProceduralCity:
                 if len(chosen) >= cfg.max_signals:
                     break
         return chosen
+
+    def _build_road_graph(self, grid, v_roads, h_roads):
+        """Lattice of corridor centre-line crossings with 4-neighbour adjacency.
+
+        Traffic routes are random walks on this lattice. That is what keeps
+        rule-based vehicles on the road *without* giving each one a full
+        collision-avoiding controller: a route assembled from corridor centre
+        lines cannot leave the corridor, so traffic can never wander into a
+        building, wedge itself in a doorway and block a street for the episode.
+
+        Unlike `_find_intersections` this keeps T-junctions and dead ends too --
+        a vehicle has to be able to drive through them, it just cannot be
+        signalled there.
+
+        Returns (nodes, links) where nodes is (K, 2) world-space centres and
+        links is (K, 4) neighbour node indices (-1 for none), indexed by
+        DIRS below: 0 = +x, 1 = +y, 2 = -x, 3 = -y.
+        """
+        cfg = self.cfg
+        ts, rw = cfg.tile_size, cfg.road_width
+        h, w = grid.shape
+        half = rw // 2
+
+        # index[(i, j)] -> node id, for i over h_roads (y) and j over v_roads (x)
+        index = {}
+        nodes = []
+        for i, hy in enumerate(h_roads):
+            for j, vx in enumerate(v_roads):
+                cr, cc = hy + half, vx + half
+                if not (0 <= cr < h and 0 <= cc < w and grid[cr, cc] == ROAD):
+                    continue
+                index[(i, j)] = len(nodes)
+                nodes.append(((vx + rw / 2) * ts, (hy + rw / 2) * ts))
+
+        links = np.full((len(nodes), 4), -1, dtype=np.int32)
+        for (i, j), nid in index.items():
+            cr, cc = h_roads[i] + half, v_roads[j] + half
+            # +x / -x neighbours: the centre row between the two crossings must be road.
+            for dj, d in ((1, 0), (-1, 2)):
+                other = index.get((i, j + dj))
+                if other is None:
+                    continue
+                c0, c1 = sorted((cc, v_roads[j + dj] + half))
+                if (grid[cr, c0:c1 + 1] == ROAD).all():
+                    links[nid, d] = other
+            # +y / -y neighbours: the centre column between the two crossings.
+            for di, d in ((1, 1), (-1, 3)):
+                other = index.get((i + di, j))
+                if other is None:
+                    continue
+                r0, r1 = sorted((cr, h_roads[i + di] + half))
+                if (grid[r0:r1 + 1, cc] == ROAD).all():
+                    links[nid, d] = other
+
+        return np.asarray(nodes, dtype=np.float64).reshape(-1, 2), links
+
+    def _parking_spots(self, grid, nodes):
+        """Kerbside parking slots as an (M, 3) array of (x, y, heading).
+
+        A slot is a road tile with a wall on one side; the car hugs that wall and
+        faces the way traffic flows on that side of the corridor (right-hand
+        traffic), so parked cars read as parked rather than abandoned.
+
+        Slots inside a crossing are dropped: a car parked in an intersection
+        blocks a turn the ego may have to make, and with `road_width=3` there is
+        no room to go around it.
+        """
+        cfg = self.cfg
+        ts = cfg.tile_size
+        h, w = grid.shape
+        if self.road_cells is None or len(self.road_cells) == 0:
+            return np.zeros((0, 3))
+
+        rows = self.road_cells[:, 0].astype(np.int64)
+        cols = self.road_cells[:, 1].astype(np.int64)
+        # Park this far from the wall: half a car width plus a little clearance.
+        inset = 0.95 + 0.15
+
+        def solid(dr, dc):
+            r, c = rows + dr, cols + dc
+            inside = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+            out = np.ones(len(rows), dtype=bool)      # out of bounds counts as wall
+            out[inside] = grid[r[inside], c[inside]] == BUILDING
+            return out
+
+        cx = (cols + 0.5) * ts          # along-corridor centre of the tile
+        cy = (rows + 0.5) * ts
+        HALF_PI = np.pi / 2.0
+        # A 4.4 m car in a 4 m tile overhangs 0.2 m at each end, so both
+        # along-corridor neighbours have to be road or the parked car's nose ends
+        # up inside a wall -- which the ego's LIDAR then reports as a phantom
+        # obstacle sticking out of a building.
+        ew_ok = ~solid(0, -1) & ~solid(0, 1)      # corridor runs E-W: clear along x
+        ns_ok = ~solid(-1, 0) & ~solid(1, 0)      # corridor runs N-S: clear along y
+        # Right of travel is (dx, dy) -> (-dy, dx) in these screen-down coords, so
+        # the +y kerb of an E-W street carries eastbound traffic, and so on.
+        sides = [
+            (solid(-1, 0) & ew_ok, cx, rows * ts + inset,        np.pi),      # wall to -y
+            (solid(1, 0) & ew_ok,  cx, (rows + 1) * ts - inset,  0.0),        # wall to +y
+            (solid(0, -1) & ns_ok, cols * ts + inset,       cy,  HALF_PI),    # wall to -x
+            (solid(0, 1) & ns_ok,  (cols + 1) * ts - inset, cy, -HALF_PI),    # wall to +x
+        ]
+
+        out = []
+        for mask, sx, sy, heading in sides:
+            if not mask.any():
+                continue
+            xs = np.broadcast_to(sx, mask.shape)[mask]
+            ys = np.broadcast_to(sy, mask.shape)[mask]
+            out.append(np.stack([xs, ys, np.full(len(xs), heading)], axis=1))
+        if not out:
+            return np.zeros((0, 3))
+        spots = np.concatenate(out, axis=0)
+
+        if len(nodes):
+            keep_clear = (cfg.road_width / 2.0) * ts + 2.0
+            near = ((np.abs(spots[:, 0:1] - nodes[None, :, 0]) < keep_clear) &
+                    (np.abs(spots[:, 1:2] - nodes[None, :, 1]) < keep_clear)).any(axis=1)
+            spots = spots[~near]
+        return spots
 
     def _road_positions(self, extent):
         """Pick corridor start indices spaced by randomised block widths."""

@@ -12,9 +12,7 @@ from baselines.scripted import GapFollower
 cfg = EnvConfig()
 env = CarNavEnv(config=cfg, city_config=CityConfig(width=48, height=48, tile_size=4.0),
                 obs_type="vector", seed=99)
-drv = GapFollower(n_beams=cfg.n_beams, lidar_range=cfg.lidar_range,
-                  max_speed=env.car.p.max_speed,
-                  car_length=env.car.p.length, car_width=env.car.p.width)
+drv = GapFollower.for_env(env)
 ts = env.city.tile_size
 p = env.car.p
 

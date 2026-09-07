@@ -20,6 +20,7 @@ import numpy as np
 from .world import ProceduralCity, CityConfig
 from .car import Car, CarParams
 from .sensors import Lidar, nav_features, dynamics_features, relative_bearing
+from .traffic import Traffic, TRAFFIC_FEATURES
 
 try:                                    # gymnasium is optional
     import gymnasium as gym
@@ -142,6 +143,13 @@ class EnvConfig:
         red_light_penalty=50.0,
         n_tl_obs=None,          # None = 1 when lights are on, else 0
         tl_obs_range=60.0,
+        # --- traffic
+        traffic=True,
+        n_traffic=8,            # vehicles driving the grid
+        n_parked=18,            # vehicles parked at the kerb
+        traffic_speed=9.0,      # cruise speed, jittered per vehicle
+        n_traffic_obs=None,     # None = 4 when traffic is on, else 0
+        traffic_obs_range=60.0,
     ):
         self.n_targets = n_targets              # waypoints per episode
         self.n_lookahead = n_lookahead          # waypoints exposed in the observation
@@ -168,6 +176,15 @@ class EnvConfig:
         self.red_light_penalty = red_light_penalty
         self.n_tl_obs = (1 if traffic_lights else 0) if n_tl_obs is None else n_tl_obs
         self.tl_obs_range = tl_obs_range
+        # Same one-switch discipline as the lights: `traffic=False` removes the
+        # vehicles, the observation block and the rendered meshes together, so the
+        # agent is never asked about something it cannot see or crash into.
+        self.traffic = traffic
+        self.n_traffic = n_traffic if traffic else 0
+        self.n_parked = n_parked if traffic else 0
+        self.traffic_speed = traffic_speed
+        self.n_traffic_obs = (4 if traffic else 0) if n_traffic_obs is None else n_traffic_obs
+        self.traffic_obs_range = traffic_obs_range
 
 
 class CarNavEnv(_BaseEnv):
@@ -216,6 +233,7 @@ class CarNavEnv(_BaseEnv):
             city_cfg.max_signals = 0
         self.city = ProceduralCity(city_cfg, seed=seed)
         self.car = Car(car_params or CarParams())
+        self.traffic = Traffic(self.city, self.cfg, self.rng)
         self.lidar = Lidar(
             n_beams=self.cfg.n_beams,
             max_range=self.cfg.lidar_range,
@@ -235,11 +253,13 @@ class CarNavEnv(_BaseEnv):
         self.terminated_reason = None
         self._in_intersection = set()   # indices of TLs the car is currently inside
         self.red_light_violations = 0
+        self.crash_with = None
 
         # --- spaces
         self.action_space = _box(-1.0, 1.0, (3,))
         self.vector_dim = (self.cfg.n_beams + 5 + 3 * self.cfg.n_lookahead
-                           + TL_FEATURES * self.cfg.n_tl_obs)
+                           + TL_FEATURES * self.cfg.n_tl_obs
+                           + TRAFFIC_FEATURES * self.cfg.n_traffic_obs)
         vec_space = _box(-1.0, 1.0, (self.vector_dim,))
         img_space = _box(0, 255, (image_size, image_size, 3), np.uint8)
         if obs_type == "vector":
@@ -275,6 +295,11 @@ class CarNavEnv(_BaseEnv):
         self.car.reset(x, y, heading)
         self._sample_targets()
 
+        # After the ego pose, so traffic can be kept clear of it. `sample_free_pose`
+        # only checks buildings, so a vehicle spawned on the spawn point would put
+        # back the unwinnable start that the swept-clearance check removes.
+        self.traffic.reset(x, y)
+
         self.target_idx = 0
         self.step_count = 0
         self.episode_reward = 0.0
@@ -283,10 +308,11 @@ class CarNavEnv(_BaseEnv):
         self.terminated_reason = None
         self._in_intersection = set()
         self.red_light_violations = 0
+        self.crash_with = None
         self.prev_dist = self._dist_to_target()
 
         if self._renderer is not None:
-            self._renderer.build_scene(self.city)
+            self._renderer.build_scene(self.city, self.traffic)
 
         return self._observe(), self._info()
 
@@ -319,13 +345,21 @@ class CarNavEnv(_BaseEnv):
 
         for _ in range(cfg.action_repeat):
             self.car.step(throttle, brake, steer, cfg.dt)
+            # Traffic moves inside the repeat loop, on the same clock as the ego.
+            # Stepping it once per env step instead would let a vehicle jump
+            # action_repeat * dt * v metres between collision checks and pass
+            # clean through the car.
+            self.traffic.step(cfg.dt, self.car, self.traffic_lights)
             reward -= cfg.time_penalty
 
-            if self.city.collides(self.car.x, self.car.y, self.car.heading,
-                                  self.car.p.length, self.car.p.width):
+            hit_building = self.city.collides(
+                self.car.x, self.car.y, self.car.heading,
+                self.car.p.length, self.car.p.width)
+            if hit_building or self.traffic.hits(self.car):
                 reward -= cfg.crash_penalty
                 terminated = crashed = True
                 self.terminated_reason = "crash"
+                self.crash_with = "building" if hit_building else "vehicle"
                 break
 
             dist = self._dist_to_target()
@@ -375,9 +409,14 @@ class CarNavEnv(_BaseEnv):
         # detector and the signal timings are silently coupled: a red lasts
         # GREEN+YELLOW steps, so any cycle longer than stuck_steps would terminate
         # the episode *for obeying the law*.
+        # Queueing behind stopped traffic is exempt for the same reason: the
+        # episode must not end because the agent correctly declined to drive into
+        # the back of a car. Early termination is reward-neutral, so being generous
+        # here costs nothing but compute.
         if not terminated and cfg.stuck_steps:
             idle = self.car.speed < cfg.stuck_speed
-            self.stuck_count = self.stuck_count + 1 if (idle and not self._waiting_at_red()) else 0
+            held = idle and (self._waiting_at_red() or self._blocked_by_traffic())
+            self.stuck_count = self.stuck_count + 1 if (idle and not held) else 0
             if self.stuck_count >= cfg.stuck_steps:
                 remaining = max(0, cfg.max_episode_steps - self.step_count)
                 reward -= cfg.time_penalty * remaining * cfg.action_repeat
@@ -455,12 +494,39 @@ class CarNavEnv(_BaseEnv):
                 return True
         return False
 
+    def _blocked_by_traffic(self):
+        """True if a stopped moving vehicle is directly ahead within a car length.
+
+        Restricted to the moving population and to vehicles that are themselves
+        stopped, so this cannot be gamed by idling next to a parked car.
+        """
+        t = self.traffic
+        m = t.n_moving
+        if m == 0:
+            return False
+        car = self.car
+        c, s = np.cos(car.heading), np.sin(car.heading)
+        dx, dy = t.x[:m] - car.x, t.y[:m] - car.y
+        fwd = dx * c + dy * s
+        lat = np.abs(-dx * s + dy * c)
+        gap = fwd - (car.p.length + t.length[:m]) / 2.0
+        return bool(((t.speed[:m] < 1.0) & (fwd > 0.0) & (gap < 5.0)
+                     & (lat < (car.p.width + t.width[:m]) / 2.0 + 0.6)).any())
+
     def vector_obs(self):
-        scan = self.lidar.scan(self.city, self.car.x, self.car.y, self.car.heading)
+        # Vehicles are not part of the tile grid, so they reach LIDAR through the
+        # circle-obstacle path. Same circles as the collision test, so a range the
+        # agent is shown always matches the shape it would hit.
+        obstacles = self.traffic.circles(self.car.x, self.car.y, self.cfg.lidar_range)
+        scan = self.lidar.scan(self.city, self.car.x, self.car.y, self.car.heading,
+                               obstacles=obstacles)
         dyn = dynamics_features(self.car)
         nav = nav_features(self.car, self.targets, self.target_idx,
                            self.cfg.n_lookahead, self.cfg.nav_range)
-        return np.concatenate([scan, dyn, nav, self._tl_features()]).astype(np.float32)
+        traf = self.traffic.obs_features(self.car, self.cfg.n_traffic_obs,
+                                        self.cfg.traffic_obs_range,
+                                        self.car.p.max_speed)
+        return np.concatenate([scan, dyn, nav, self._tl_features(), traf]).astype(np.float32)
 
     def _tl_features(self):
         """Encode the n_tl_obs nearest signals, ego-centrically, in [-1, 1].
@@ -524,7 +590,7 @@ class CarNavEnv(_BaseEnv):
     def image_obs(self):
         if self._renderer is None:
             self._renderer = self._make_default_renderer()
-            self._renderer.build_scene(self.city)
+            self._renderer.build_scene(self.city, self.traffic)
         return self._renderer.capture(self, size=self.image_size)
 
     def _make_default_renderer(self):
@@ -562,6 +628,7 @@ class CarNavEnv(_BaseEnv):
             "reason": self.terminated_reason,
             "is_success": self.terminated_reason == "success",
             "red_light_violations": self.red_light_violations,
+            "crash_with": self.crash_with,
         }
 
     # ------------------------------------------------------------------
@@ -572,7 +639,7 @@ class CarNavEnv(_BaseEnv):
             return None
         if self._renderer is None:
             self._renderer = self._make_default_renderer()
-            self._renderer.build_scene(self.city)
+            self._renderer.build_scene(self.city, self.traffic)
         return self._renderer.capture(self, size=self.image_size)
 
     def close(self):

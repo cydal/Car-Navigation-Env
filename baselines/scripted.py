@@ -46,15 +46,24 @@ class GapFollower:
         min_speed=2.0,
         brake_decel=6.0,
         stop_margin=3.5,
-        n_tl_obs=0,
+        n_tl_obs=1,
         tl_obs_range=60.0,
         tl_stop_margin=2.0,
+        n_traffic_obs=4,
+        traffic_obs_range=60.0,
+        follow_lat=2.5,
+        follow_gap=4.0,
     ):
         self.n_beams = n_beams
         self.n_lookahead = n_lookahead
         self.n_tl_obs = n_tl_obs
         self.tl_obs_range = tl_obs_range
         self.tl_stop_margin = tl_stop_margin  # metres to stop short of the stop line
+        self.n_traffic_obs = n_traffic_obs
+        self.traffic_obs_range = traffic_obs_range
+        self.follow_lat = follow_lat          # lateral window for "in my path"
+        self.follow_gap = follow_gap          # bumper gap held in a queue
+        self.car_length = car_length
         self.lidar_range = lidar_range
         self.max_speed = max_speed
         self.max_steer = max_steer
@@ -85,6 +94,8 @@ class GapFollower:
             hw / np.maximum(np.abs(np.sin(self.offsets)), eps),
         )
 
+        self.half_width = car_width / 2.0
+
         # Side beams, for measuring how far off-centre we are in a street.
         deg = np.degrees(self.offsets)
         self.right_mask = (deg > 65.0) & (deg < 115.0)     # +offset == toward +y
@@ -92,16 +103,50 @@ class GapFollower:
 
         self.steer_prev = 0.0
 
+    @classmethod
+    def for_env(cls, env, **kw):
+        """Build a driver matching an env's observation layout and car dimensions.
+
+        Still obs-only: what is read here is the *shape* of the observation and the
+        car's own geometry, never the world, the targets or the traffic. Having one
+        place that does it stops four call sites from disagreeing about the layout,
+        which is how the traffic-light slice came to be mis-read in the first place.
+        """
+        c, p = env.cfg, env.car.p
+        return cls(n_beams=c.n_beams, n_lookahead=c.n_lookahead,
+                   lidar_range=c.lidar_range, max_speed=p.max_speed,
+                   max_steer=p.max_steer, car_length=p.length, car_width=p.width,
+                   wheelbase=p.wheelbase,
+                   n_tl_obs=c.n_tl_obs, tl_obs_range=c.tl_obs_range,
+                   n_traffic_obs=c.n_traffic_obs,
+                   traffic_obs_range=c.traffic_obs_range, **kw)
+
     def reset(self):
         """Clear the steering filter between episodes."""
         self.steer_prev = 0.0
 
     # ------------------------------------------------------------------
     def unpack(self, obs):
-        """Split the flat observation into scan / dynamics / nav / traffic-light."""
+        """Split the flat observation into scan / dynamics / nav / lights / traffic.
+
+        Every block is sliced by its own declared width rather than taking "the
+        rest" as the traffic-light slice. That shortcut worked while lights were
+        the last block, but appending traffic behind them made it hand vehicle
+        features to the signal logic, which reads index 3 as `red` -- a driver
+        braking for a phantom light whenever a car happened to be nearby. The
+        length check turns any future layout change into an error instead.
+        """
         n = self.n_beams
         nav_end = n + 5 + 3 * self.n_lookahead
-        return obs[:n], obs[n:n + 5], obs[n + 5:nav_end], obs[nav_end:]
+        tl_end = nav_end + 7 * self.n_tl_obs
+        traf_end = tl_end + 5 * self.n_traffic_obs
+        if traf_end != len(obs):
+            raise ValueError(
+                f"observation is {len(obs)}-D but this driver expects {traf_end}-D "
+                f"(n_beams={n}, n_lookahead={self.n_lookahead}, "
+                f"n_tl_obs={self.n_tl_obs}, n_traffic_obs={self.n_traffic_obs})")
+        return (obs[:n], obs[n:n + 5], obs[n + 5:nav_end],
+                obs[nav_end:tl_end], obs[tl_end:traf_end])
 
     def _red_light_stop_speed(self, tl):
         """Target speed to hold for the nearest signal, or None if it is not ours.
@@ -123,6 +168,55 @@ class GapFollower:
         room = max(0.0, to_line - self.tl_stop_margin)
         return float(np.sqrt(2.0 * self.brake_decel * room))
 
+    def _traffic_follow_speed(self, traf, speed):
+        """Speed to hold behind the nearest vehicle in our own path, or None.
+
+        LIDAR already slows the car for traffic -- the vehicles are in the scan --
+        but the result is floored at `min_speed`, so the car creeps into whatever
+        it has stopped behind. Queueing needs a genuine zero, exactly like a red
+        light, and for the same reason: the floor exists to stop dithering in a
+        corridor, not to forbid stopping.
+
+        Only vehicles travelling *with* us count. An oncoming car sits inside the
+        lateral window too on a 12 m undivided corridor, and halting for one would
+        freeze the baseline at every passing car; both parties keeping right is
+        what resolves that, which the corridor centering term already does.
+        """
+        if traf.size < 5:
+            return None
+        best = None
+        for i in range(0, traf.size - 4, 5):
+            sin_b, cos_b = float(traf[i + 1]), float(traf[i + 2])
+            if sin_b == 0.0 and cos_b == 0.0:
+                continue                        # padded empty slot, not a vehicle
+            d = float(traf[i]) * self.traffic_obs_range
+            fwd, lat = d * cos_b, d * sin_b
+            if fwd <= 0.0 or abs(lat) > self.follow_lat:
+                continue
+            # The block carries velocity *relative to us*; add our own back to get
+            # the leader's, which is what sets how slowly we have to end up going.
+            v_lead = float(traf[i + 3]) * self.max_speed + speed
+            if v_lead < -0.5:
+                continue                        # closing head-on: not a leader
+            room = max(0.0, fwd - self.car_length - self.follow_gap)
+            v = float(np.sqrt(max(0.0, v_lead) ** 2 + 2.0 * self.brake_decel * room))
+            best = v if best is None else min(best, v)
+        return best
+
+    def _forward_room(self, eff):
+        """How far the car can carry straight on before its body meets something.
+
+        A fixed forward cone is wrong at both ends: at 20 m a 25 deg cone spans
+        wider than a 12 m street and calls the far kerb an obstacle, while a single
+        beam misses a car sitting half a lane over. Project each beam's hit into the
+        car's frame instead and keep the ones landing inside a body-width corridor
+        ahead -- the same swept test `world.sample_free_pose` uses for spawn poses.
+        """
+        fwd = eff * np.cos(self.offsets)
+        lat = np.abs(eff * np.sin(self.offsets))
+        blocking = (fwd > 0.0) & (lat < self.half_width + 0.3)
+        return float(fwd[blocking].min()) if blocking.any() else self.lidar_range
+
     def _windowed_clearance(self, eff):
         """Shrink each beam's range to the min of itself and its neighbours.
 
@@ -136,7 +230,7 @@ class GapFollower:
         return float(clear[idx])
 
     def act(self, obs):
-        scan, dyn, nav, tl = self.unpack(obs)
+        scan, dyn, nav, tl, traf = self.unpack(obs)
         speed = float(dyn[0]) * self.max_speed
         bearing = float(np.arctan2(nav[1], nav[2]))
 
@@ -198,16 +292,38 @@ class GapFollower:
         room = max(0.0, clears[best] - self.stop_margin)
         v_safe = np.sqrt(2.0 * self.brake_decel * room)
         v_turn = self.cruise_speed * (1.0 - 0.45 * abs(steer))
-        target = float(np.clip(min(self.cruise_speed, v_safe, v_turn), self.min_speed, self.cruise_speed))
 
-        # A red light is the one case where a full stop is correct, so it has to
-        # bypass the min_speed floor -- that floor exists to stop the car dithering
-        # in a corridor, and applying it here would make obeying a red impossible.
-        # Gated on the slice actually being present, not on a constructor flag, so
-        # the controller adapts to an env with or without lights without retuning.
+        # The `min_speed` floor exists to stop the car dithering to a halt in an
+        # open corridor, so it applies to the *comfort* terms only. Every constraint
+        # that comes from something real -- LIDAR clearance, a red light, a queue
+        # ahead -- has to be able to command an actual zero. With the floor applied
+        # after them the car rolled into whatever it had stopped for at 2 m/s, which
+        # is how 20 of 35 vehicle collisions happened to a target it had been
+        # tracking straight ahead for 15+ steps.
+        target = float(np.clip(min(self.cruise_speed, v_turn),
+                               self.min_speed, self.cruise_speed))
+        target = min(target, float(v_safe))
+
+        # Speed has to respect where the car is actually *going*, not only where it
+        # has decided to aim. Those coincide closely enough among static buildings,
+        # which is why this was never noticed, but they diverge by more than 5 m on
+        # 44% of steps: a vehicle stopped straight ahead while the controller aims
+        # 40 deg off to take a turn left the speed term reading open road. Six of
+        # eight sampled collisions were at 7-9 m/s with 1-3 m of clearance in front
+        # of the bumper and 20-35 m along the chosen heading.
+        room_f = max(0.0, self._forward_room(eff) - self.stop_margin)
+        target = min(target, float(np.sqrt(2.0 * self.brake_decel * room_f)))
+
+        # Both of these gate on their slice being present in the observation rather
+        # than on a constructor flag, so the controller adapts to an env with or
+        # without lights and traffic without retuning.
         v_light = self._red_light_stop_speed(tl)
         if v_light is not None:
             target = min(target, v_light)
+
+        v_follow = self._traffic_follow_speed(traf, speed)
+        if v_follow is not None:
+            target = min(target, v_follow)
 
         err = target - speed
         if err > 0.25:
@@ -232,6 +348,7 @@ class GapFollower:
             "centering": centering,
             "in_corridor": in_corridor,
             "v_light": v_light,
+            "v_follow": v_follow,
         }
 
         # Env expects every channel in [-1, 1]; throttle/brake are rescaled to [0, 1].
