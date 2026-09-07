@@ -159,6 +159,8 @@ class PandaRenderer:
         self._city_np = None
         self._rays_np = None
         self._cam_pos = None          # only used when smooth > 0
+        self._tl_nps = []             # [(static_np, [r_np, y_np, g_np]), ...]
+        self._tl_lamp_nps = []        # [[r_np, y_np, g_np], ...] — parallel to city.intersections
         self._setup_lights()
         self._setup_actors()
 
@@ -392,6 +394,79 @@ class PandaRenderer:
                 wpt_np.hide()
 
     # ------------------------------------------------------------------
+    # Traffic lights
+    # ------------------------------------------------------------------
+
+    def _setup_traffic_lights(self, city):
+        """Create post + housing + 3 lamp NodePaths for every intersection."""
+        for static_np, lamp_nps in self._tl_nps:
+            static_np.removeNode()
+            for ln in lamp_nps:
+                ln.removeNode()
+        self._tl_nps = []
+        self._tl_lamp_nps = []
+
+        if not city.intersections:
+            return
+
+        half_road = (city.cfg.road_width / 2.0) * city.tile_size  # e.g. 6.0 m
+        inset = 1.0   # metres inside the crossing corner
+
+        POST_W, POST_H = 0.24, 4.2
+        HOUS_W, HOUS_H = 0.46, 1.6
+        LAMP_W, LAMP_H = 0.28, 0.36
+        POST_COL  = (0.16, 0.16, 0.16, 1)
+        HOUSE_COL = (0.10, 0.10, 0.10, 1)
+        # dim colours for inactive lamps (red, yellow, green)
+        DIM = [(0.22, 0.04, 0.04, 1), (0.22, 0.18, 0.04, 1), (0.04, 0.22, 0.04, 1)]
+
+        for cx, cy in city.intersections:
+            # NW corner of crossing in Panda (Y-mirrored) space
+            pan_x = cx - half_road + inset
+            pan_y = -cy + half_road - inset
+
+            hw = POST_W / 2
+            static_verts = np.concatenate([
+                _box_mesh((pan_x - hw, pan_y - hw, 0.0),
+                          (pan_x + hw, pan_y + hw, POST_H), POST_COL),
+                _box_mesh((pan_x - HOUS_W / 2, pan_y - HOUS_W / 2, POST_H),
+                          (pan_x + HOUS_W / 2, pan_y + HOUS_W / 2, POST_H + HOUS_H), HOUSE_COL),
+            ])
+            static_np = _mesh_to_node("tl_static", static_verts)
+            static_np.reparentTo(self.base.render)
+
+            # Lamps: index 0=red (top), 1=yellow (middle), 2=green (bottom)
+            lamp_nps = []
+            lw = LAMP_W / 2
+            for j in range(3):
+                lz0 = POST_H + 0.12 + (2 - j) * (LAMP_H + 0.06)
+                lamp_verts = _box_mesh(
+                    (pan_x - lw, pan_y - lw, lz0),
+                    (pan_x + lw, pan_y + lw, lz0 + LAMP_H),
+                    DIM[j])
+                ln = _mesh_to_node(f"tl_lamp_{j}", lamp_verts)
+                ln.reparentTo(self.base.render)
+                ln.setLightOff()
+                lamp_nps.append(ln)
+
+            self._tl_nps.append((static_np, lamp_nps))
+            self._tl_lamp_nps.append(lamp_nps)
+
+    # Bright colours for active lamps (red, yellow, green)
+    _TL_ON  = [(1.00, 0.06, 0.04, 1), (1.00, 0.88, 0.04, 1), (0.08, 1.00, 0.08, 1)]
+    _TL_OFF = [(0.22, 0.04, 0.04, 1), (0.22, 0.18, 0.04, 1), (0.04, 0.22, 0.04, 1)]
+
+    def _update_traffic_lights(self, env):
+        tls = getattr(env, 'traffic_lights', [])
+        for tl, lamp_nps in zip(tls, self._tl_lamp_nps):
+            state = tl.ns_state
+            for j, (on_col, off_col) in enumerate(zip(self._TL_ON, self._TL_OFF)):
+                active = (j == 0 and state == 'red') or \
+                         (j == 1 and state == 'yellow') or \
+                         (j == 2 and state == 'green')
+                lamp_nps[j].setColor(*(on_col if active else off_col))
+
+    # ------------------------------------------------------------------
     def build_scene(self, city):
         """(Re)build the city mesh. Called on every reset, so it must be quick."""
         if self._city_np is not None:
@@ -508,6 +583,8 @@ class PandaRenderer:
         self._city_np.reparentTo(self.base.render)
         self._cam_pos = None
 
+        self._setup_traffic_lights(city)
+
         if self.show_minimap and self._mm_city_tex is not None:
             self._build_minimap_texture(city)
 
@@ -599,6 +676,7 @@ class PandaRenderer:
         self._place_camera(env)
         self._place_actors(env)
         self._draw_rays(env)
+        self._update_traffic_lights(env)
         if self.show_minimap:
             self._update_minimap(env)
 
@@ -632,6 +710,12 @@ class PandaRenderer:
         if self._rays_np is not None:
             self._rays_np.removeNode()
             self._rays_np = None
+        for static_np, lamp_nps in self._tl_nps:
+            static_np.removeNode()
+            for ln in lamp_nps:
+                ln.removeNode()
+        self._tl_nps = []
+        self._tl_lamp_nps = []
         if self._mm_np is not None:
             self._mm_np.removeNode()
             self._mm_np = None

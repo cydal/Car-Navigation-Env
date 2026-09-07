@@ -59,6 +59,7 @@ class ProceduralCity:
         self.height = self.cfg.height
         self.grid = None
         self.road_cells = None      # (N, 2) array of (row, col) reachable road tiles
+        self.intersections = []     # (x, y) world-space centres of road crossings
         self.generate()
 
     # ------------------------------------------------------------------
@@ -92,11 +93,30 @@ class ProceduralCity:
             if len(cells) >= 0.05 * cfg.width * cfg.height:
                 self.grid = grid
                 self.road_cells = cells
+                self.intersections = self._find_intersections(grid, v_roads, h_roads)
                 return
 
         # Fall back to whatever the last attempt produced rather than looping forever.
         self.grid = grid
         self.road_cells = cells
+        self.intersections = self._find_intersections(grid, v_roads, h_roads)
+
+    def _find_intersections(self, grid, v_roads, h_roads):
+        """Return world-space (x, y) centres where v_road and h_road corridors cross."""
+        cfg = self.cfg
+        ts = cfg.tile_size
+        rw = cfg.road_width
+        result = []
+        for vx in v_roads:
+            for hy in h_roads:
+                cr = hy + rw // 2
+                cc = vx + rw // 2
+                if 0 <= cr < cfg.height and 0 <= cc < cfg.width and grid[cr, cc] == ROAD:
+                    result.append((
+                        float((vx + rw / 2) * ts),
+                        float((hy + rw / 2) * ts),
+                    ))
+        return result
 
     def _road_positions(self, extent):
         """Pick corridor start indices spaced by randomised block widths."""

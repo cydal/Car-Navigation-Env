@@ -53,6 +53,33 @@ def _box(low, high, shape, dtype=np.float32):
 _BaseEnv = gym.Env if _HAS_GYM else object
 
 
+class TrafficLight:
+    """Two-phase signal: N-S green then E-W green, with yellow transitions."""
+    GREEN_STEPS  = 80   # simulation steps per green phase
+    YELLOW_STEPS = 12   # simulation steps per yellow phase
+
+    def __init__(self, x, y, phase=0, timer=0):
+        self.x = x
+        self.y = y
+        self.phase = phase  # 0=NS-green, 1=NS-yellow, 2=EW-green, 3=EW-yellow
+        self.timer = timer
+
+    def tick(self):
+        limit = self.YELLOW_STEPS if self.phase % 2 == 1 else self.GREEN_STEPS
+        self.timer += 1
+        if self.timer >= limit:
+            self.phase = (self.phase + 1) % 4
+            self.timer = 0
+
+    @property
+    def ns_state(self):
+        return ('green', 'yellow', 'red', 'red')[self.phase]
+
+    @property
+    def ew_state(self):
+        return ('red', 'red', 'green', 'yellow')[self.phase]
+
+
 class EnvConfig:
     """Task and episode settings, kept separate from world/vehicle config."""
 
@@ -147,6 +174,7 @@ class CarNavEnv(_BaseEnv):
 
         # --- episode state
         self.targets = []
+        self.traffic_lights = []
         self.target_idx = 0
         self.step_count = 0
         self.episode_reward = 0.0
@@ -181,6 +209,12 @@ class CarNavEnv(_BaseEnv):
 
         if self.cfg.randomize_map:
             self.city.generate()
+
+        # Stagger phases so not every intersection turns green simultaneously.
+        self.traffic_lights = [
+            TrafficLight(x, y, phase=i % 4, timer=(i * 23) % TrafficLight.GREEN_STEPS)
+            for i, (x, y) in enumerate(self.city.intersections)
+        ]
 
         x, y, heading = self.city.sample_free_pose(self.car.p.length, self.car.p.width)
         self.car.reset(x, y, heading)
@@ -251,6 +285,8 @@ class CarNavEnv(_BaseEnv):
                 self.prev_dist = self._dist_to_target()
 
         self.step_count += 1
+        for tl in self.traffic_lights:
+            tl.tick()
 
         # Idling is discouraged by the time penalty; cutting the episode short
         # here only saves compute. The remaining penalty is charged as a lump sum
