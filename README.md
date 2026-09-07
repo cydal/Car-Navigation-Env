@@ -35,6 +35,7 @@ Both paths are live, and the cost of each is measured (see Performance).
 | `env/world.py` | procedural city grid, ray casting, collision, spawn sampling, signal placement |
 | `env/car.py` | kinematic bicycle model with a rate-limited steering actuator |
 | `env/sensors.py` | 360° LIDAR, ego-centric nav and proprioception features |
+| `env/traffic.py` | on-rails moving vehicles and kerbside parked cars |
 | `env/nav_env.py` | Gymnasium-style env: observations, reward, termination, traffic-light state |
 | `render/panda_renderer.py` | Panda3D third-person renderer (offscreen or windowed) |
 | `baselines/scripted.py` | follow-the-gap + pure-pursuit driver, obs-only |
@@ -50,18 +51,38 @@ env works without it.
 
 `obs_type` selects `"vector"`, `"image"` or `"both"`.
 
-**Vector — 53 dimensions, all in [-1, 1], entirely ego-centric:**
+**Vector — 73 dimensions, all in [-1, 1], entirely ego-centric:**
 
 | block | dims | contents |
 |---|---|---|
-| LIDAR | 32 | full 360°, 60 m range, normalised. Beam `n/2` is straight ahead, so the array's wrap-around discontinuity sits at the rear where it carries least information. |
+| LIDAR | 32 | full 360°, 60 m range, normalised. Beam `n/2` is straight ahead, so the array's wrap-around discontinuity sits at the rear where it carries least information. Parked and moving vehicles are in the scan, so the ranges already describe them as geometry. |
 | dynamics | 5 | speed, yaw rate, **steer angle**, acceleration, slip angle |
 | navigation | 9 | next 3 waypoints × (distance, sin, cos) of bearing |
 | traffic light | 7 | nearest signal: distance **to the stop line**, sin/cos bearing, red/yellow/green for *this car's approach axis*, steps until the phase changes |
+| traffic | 20 | nearest 4 **moving** vehicles × (distance, sin/cos bearing, relative velocity in the ego frame) |
 
-Set `EnvConfig(traffic_lights=False)` to drop the last block and get the original
-46-D vector; that switch also disables the red-light penalty, because penalising
-a signal the agent cannot see is not a rule it can learn.
+The traffic block exists for **the velocity alone**. LIDAR already reports where
+the metal is and roughly what shape it has, but a single scan cannot say whether
+the car ahead is stopped or doing 10 m/s away from you, so without velocity the
+observation is not Markov for anything involving traffic — the same argument that
+puts `steer_angle` in the dynamics block. Parked cars are deliberately *absent*
+from it: their velocity is always zero, so they would fill the nearest-4 slots
+with nothing LIDAR does not already carry. They are static geometry, no different
+in kind from a wall.
+
+Two switches shrink it, and each drives the simulation, the observation *and* the
+rendered geometry together:
+
+| config | dims | vehicles |
+|---|---|---|
+| defaults | 73 | 26 (8 moving) |
+| `traffic_lights=False` | 66 | 26 (8 moving) |
+| `traffic=False` | 53 | 0 |
+| both off | 46 | 0 — the original task |
+
+Turning lights off also disables
+the red-light penalty, because penalising a signal the agent cannot see is not a
+rule it can learn.
 
 There is no absolute position or heading anywhere in the observation, which is
 what lets a policy trained on one procedural layout transfer to the next instead
@@ -88,8 +109,9 @@ Braking cannot reverse the car.
 ## Reward
 
 `progress × 1.0` toward the current waypoint, `−0.1` per step, `+100` per
-waypoint reached, `−100` for a crash, `−50` for entering an intersection against
-a red.
+waypoint reached, `−100` for a crash — into a building or a vehicle alike, with
+`info["crash_with"]` saying which — and `−50` for entering an intersection
+against a red.
 
 Early termination on "stuck" charges the *remaining* time penalty as a lump sum,
 so ending an episode early is reward-neutral. Otherwise stopping dead would be a
@@ -120,6 +142,14 @@ its edge or its back from most approaches and cannot be read at all from two of
 them, which made the light unreadable exactly when it mattered. The lens stands
 proud of its backplate so the driver sees a full lit face rather than a sliver.
 
+**Traffic** — moving vehicles and kerbside parked cars, drawn from the Kenney CC0
+kit with `instanceTo` so ten body types cost one mesh each. The *physics* footprint
+is authoritative: each mesh is measured with `getTightBounds()` and scaled to the
+length the simulation uses, so a van looks as long as it collides. Moving vehicles
+hold a lane 3 m right of the corridor centre and parked cars hug the kerb facing
+the direction traffic flows on that side, which is what makes a parked car read as
+parked rather than abandoned.
+
 **Minimap (top-right corner)** — a top-down view of the full city.  Buildings
 are warm grey, road is dark blue-grey.  Elements:
 
@@ -146,7 +176,7 @@ never enters image observations.
 | ↓ arrow | brake |
 | ← / → arrow | steer left / right |
 
-The scripted driver runs when `--keys` is not set.  Both use the same 53-D
+The scripted driver runs when `--keys` is not set.  Both use the same 73-D
 observation vector — no privileged simulator access.
 
 **Offscreen vs windowed** — when `offscreen=True` (training), the minimap
@@ -154,24 +184,45 @@ overlay is suppressed so it never enters the image observation.
 
 ## Performance
 
-Measured on this machine, 48×48 tile map, 32 beams:
+Measured on this machine, 48×48 tile map, 32 beams. Configs are **interleaved and
+best-of-6**, not swept in order: a sequential sweep drifts with thermal state
+enough that a config touching no changed code once appeared to regress by 20%.
 
 | | µs/step | steps/s |
 |---|---|---|
-| vector only | ~205 | **~4,900** |
+| vector, no traffic | ~212 | **~4,700** |
+| vector, traffic on | ~410 | **~2,440** |
 | vector + 64×64 image | ~565 | **~1,750** |
 
-Ray casting is the bulk of the vector step (~158 µs of ~205 µs). Map generation
-is ~2.5 ms per reset and rebuilding the render mesh is ~5.5 ms, rising to ~8.2 ms
-with signal geometry.
+Ray casting is the bulk of the traffic-free vector step (~158 µs of ~212 µs). Map
+generation is ~2.7 ms per reset and rebuilding the render mesh is ~10 ms.
 
-**Traffic lights cost the vector path nothing measurable**: 239 µs/step with them
-off versus 233 µs/step with them on, i.e. inside run-to-run noise. This is
-checked rather than assumed, because the whole premise of the env is that the
-vector path stays fast enough to train on — a throughput regression there is a
-correctness problem, not a performance nit. The signal *geometry* costs ~2.7 ms
-per reset, but only when a renderer is attached, and it is skipped entirely when
-`traffic_lights=False`.
+**Traffic lights cost the vector path nothing measurable**: 216 µs/step with them
+off versus 212 µs with them on, inside run-to-run noise.
+
+**Traffic costs 1.93×**, and the breakdown is the interesting part:
+
+| | µs/step vs traffic off |
+|---|---|
+| `traffic=True`, zero vehicles | +0 |
+| 18 parked cars | +36 |
+| 8 moving vehicles | +192 |
+
+So it is not the sensing. Eighteen parked cars are 54 circles in the LIDAR and cost
+36 µs; eight moving vehicles are 24 circles and cost 192 µs, because what they
+actually cost is the *controller* — routes, signals, the junction reservation and
+car-following, evaluated every step. At eight vehicles that is dominated by fixed
+numpy call overhead rather than by anything that scales, so the figure is roughly
+flat in vehicle count. Resets go from 2.7 ms to 10.2 ms for the same reason: route
+generation is 900 m of 1 m polyline per vehicle, which amortises to ~18 µs/step
+over a typical episode.
+
+This is checked rather than assumed, because the whole premise of the env is that
+the vector path stays fast enough to train on — a throughput regression there is a
+correctness problem, not a performance nit. The point that mattered is that
+**`traffic=False` is unchanged at ~212 µs**, matching the pre-traffic figure, so the
+original task did not get slower; and even with traffic the vector path is ~6.5×
+the image path, which is the comparison the design brief was about.
 
 ## Design decisions worth knowing
 
@@ -255,39 +306,136 @@ the mean spacing to ~72 m and makes each signal an event.
 off an arm are T-junctions or dead ends, which do not warrant a light; requiring
 all four arms be road cut the candidates from 64 to ~31.
 
+**Moving traffic runs on rails.** Each vehicle follows a route built from corridor
+centre lines resampled to a uniform 1 m polyline, and only its *speed* varies. The
+alternative — give every vehicle a steering controller — fails badly in a 12 m
+corridor: one vehicle that misjudges a corner wedges itself in a doorway and blocks
+a street for the rest of the episode, and the ego is then punished for a situation
+it could not have caused. On rails a vehicle physically cannot leave the road, and
+speed is exactly the part the ego has to reason about anyway. Verified over 282,412
+vehicle poses: **0 centres off road**, moving vehicles holding their lane to the
+centimetre.
+
+**Traffic brakes for the ego, with finite authority.** Vehicles decelerate at
+6 m/s² for whatever is ahead in their lane, the ego included, and they yield a
+junction to an ego already inside it. That keeps collisions the agent's fault — the
+env must never hand out an unavoidable −100, the same principle behind the
+spawn-clearance check. Measured: of 41 moving-vehicle impacts, **zero** involved a
+stationary ego, so there is no class of crash the ego could not have avoided. But
+the authority is finite and the reaction is longitudinal, so cutting across a lane
+still gets you hit. Traffic is forgiving, not psychic.
+
+**Lane offset is a collision budget, not a styling choice.** A 12 m corridor holds
+two 1.9 m flows. At `LANE_OFFSET = 2.0` an ego driving the exact centre line passes
+oncoming traffic with **0.10 m** on each side. That is a tolerance no steering
+controller holds: measured over 29,584 in-corridor samples, the baseline sits a
+median 0.10 m off the centre line but *wanders* a median 1.08 m from it, with a p90
+of 3.60 m — an order of magnitude more than the budget it was being given. It is
+now 3.0 m, giving 1.10 m of clearance, which is the largest value that still clears
+the parked cars (kerb inset 1.10 m puts their inner edge at 3.95 m). This single
+number was worth more than four separate controller fixes put together; see
+Baseline.
+
+**A conflict test has to use the shape you actually collide with.** Contact between
+two 4.4 × 1.9 m cars happens at 1.90 m of lateral separation when their axes are
+parallel but at 3.15 m when they are perpendicular — then it is your flank against
+their *length*. The baseline's original single radius of 2.6 m was wrong in both
+directions at once: it missed crossing conflicts (8 of 23 crossing crashes had the
+detector reporting no conflict on the step of impact) and raising it would instead
+brake for every car in the other lane, 3 m away by construction. The tolerance is
+now keyed on relative heading, which the relative-velocity features already supply.
+Same instinct as the three-circle body model: sensor and collision must agree.
+
+**Signals start on a random phase, so spawn placement has to respect them.** A
+vehicle placed inside a junction box, or within its own stopping distance of a stop
+line, may be facing a red it physically cannot honour — it runs the light on step 0
+through no fault of its controller. Before the 18 m clearance check, traffic ran
+2.5% of reds; after it, 0 of 72.
+
+**Parked cars are static geometry and are treated as such.** They are excluded from
+the observation's traffic block (their velocity is always zero, so they would crowd
+out the vehicles whose velocity you need) and from car-following (they sit inside
+any sane same-lane threshold, so counting them would stop every vehicle behind
+every parked car and freeze the city). They also cost the baseline almost nothing:
+over 200 episodes, 18 parked cars and no moving traffic scored 35.5% full-route
+success against 35.5% for no traffic at all, and accounted for 7 collisions. The
+entire cost of traffic is the eight moving vehicles.
+
+**The braking pass along a route is closed-form.** Enforcing `v[i]² ≤ v[i+1]² + 2aΔs`
+backwards along the polyline looks like a loop, but its fixed point is
+`min_{j≥i}(u[j] + k(j−i))` on `u = v²`, which is a reverse `np.minimum.accumulate`
+of `u[j] + kj` minus `ki`. Agrees with the loop it replaced to 1.8e-13.
+
 ## Baseline
 
 `baselines/scripted.py` drives using **only the observation vector** — no
 privileged access to the world, the car object or the target list. That makes it
 a test of the observation design itself: if classical control can drive from
-these 53 numbers, the vector state carries enough to learn from, and an RL agent
+these 73 numbers, the vector state carries enough to learn from, and an RL agent
 that underperforms it has a learning problem rather than a sensing one.
 
 It combines follow-the-gap heading selection, pure-pursuit steering, corridor
-centering from left/right LIDAR asymmetry, and braking-distance speed control.
+centering from left/right LIDAR asymmetry, braking-distance speed control, a
+red-light hold and a closest-approach conflict test against moving traffic.
+`GapFollower.for_env(env)` builds one matching the env's observation layout, so
+the four call sites cannot disagree about it — which is how the traffic-light
+slice came to be mis-read once already.
 
-Over 160 episodes of 3 waypoints each:
+Over 300 pooled episodes of 3 waypoints each:
 
-| policy | mean reward | waypoints | red-light violations |
-|---|---|---|---|
-| random | −103 | 0.00 / 3 | 0.05 |
-| scripted | **+213** | **1.93 / 3** | 0.56 |
+| task | dims | mean reward | waypoints | full route | red-light violations |
+|---|---|---|---|---|---|
+| random policy | 73 | −103 | 0.00 / 3 | 0% | — |
+| no traffic, no lights | 46 | **+219** | **1.86 / 3** | **45.3%** | — |
+| lights only | 53 | +149 | 1.71 / 3 | 35.0% | 0.80 |
+| traffic + lights (default) | 73 | +107 | 1.43 / 3 | 26.0% | 0.69 |
 
-Full-route success ~49%; 40-episode blocks range from 32% to 55%, so quote
-pooled runs rather than single blocks. `test_env` asserts this stays inside a
-30–90% band: below that the task is broken, above it there is no headroom left
-for a learned policy to show anything.
+Quote pooled runs, not blocks: full-route success is a per-episode Bernoulli, so a
+40-episode block has a ~7 point standard error and drifts enough to look like a
+real change. `test_env` uses 80 and asserts the **30–90% band against the
+no-traffic task**, which is the task that band was calibrated on; the traffic task
+gets a documented 15% floor instead, for the reason below.
 
 **The baseline had to be taught to stop.** It has a `min_speed = 2.0` floor to
 stop it dithering in a corridor, which meant it structurally *could not* hold at
 a red — it was paying ~1.7 violations per episode, about −84, for a manoeuvre it
 was incapable of performing. A benchmark that a rule-following agent beats only
 by breaking rules is not measuring the task, so the red-light case now bypasses
-the floor; violations fell to 0.56 per episode with zero stuck terminations. The
-rest is control imperfection, which is exactly the headroom a learned policy
-should be able to claim. Turning lights off scores +257 against +213, so the
-signals cost the baseline ~44 per episode and are a real part of the task rather
-than a decoration.
+the floor, and so does the traffic conflict cap: queueing needs a genuine halt for
+exactly the same reason. Signals cost the baseline ~70 reward and 10 points of
+full-route success, so they are a real part of the task rather than a decoration.
+
+**Traffic is a difficulty step this controller cannot be tuned through, and that is
+the finding.** Moving traffic costs it ~42 reward and 9 points of completed routes.
+Eight fixes were implemented and measured over 200-episode A/Bs; only the two that
+were *geometry bugs* helped, and they are now fixed in the env and the driver:
+
+| attempt | result |
+|---|---|
+| widen `LANE_OFFSET` 2.0 → 3.0 | **kept** — vehicle crashes 56 → 43 |
+| anisotropic conflict footprint | **kept** — vehicle crashes → 38, geometrically correct |
+| ego in the junction reservation | **kept** — no score change, but traffic no longer drives through an ego in a junction |
+| extra braking on the traffic block | +3 points, inside noise |
+| swept forward-room check | net harmful: ~20 extra timeouts to save ~12 building crashes |
+| standing keep-right bias | monotonically worse: 22.5% → 14.5% → 8.5% as the bias grew |
+| dodge oncoming vehicles laterally | flat on vehicle crashes, worse on buildings |
+| halve traffic density | flat: 8 → 4 moving vehicles moved success 26.5% → 27.0% |
+
+The reason the four controller-side attempts all failed is that they were attacking
+the wrong variable. The diagnostics say so plainly: the ego *sees* the vehicle it
+hits for a median of 66 steps beforehand, so it is not a sensing or occlusion
+failure; and the residual is dominated by **building** crashes, which sit at
+~145/300 in every configuration including no traffic at all. Traffic does not create
+a new failure mode so much as cut episodes short before the old one gets its chance.
+A controller with no concept of a lane, of right of way, or of another driver's
+intent has a ceiling here, and that ceiling is exactly the headroom a learned
+policy is supposed to claim.
+
+What was worth fixing was the *env's* side of it, and both fixes were found by
+measuring impact geometry rather than by reasoning about the controller: the 0.10 m
+oncoming clearance (see Design decisions) and a conflict test whose shape did not
+match the collision. Head-on impacts were the largest category at 17 of 56 before
+the lane change; crossing conflicts are the largest at 22 of 43 after it.
 
 The controller gates on **the traffic-light slice being present in the
 observation**, not on a constructor flag, so it adapts to an env with or without
@@ -320,12 +468,12 @@ was found by dumping state before a crash, not by reasoning about the code.
 The task is meant to be enriched in place, reusing the same observation layout:
 
 1. **done** — reach a sequence of waypoints
-2. **done** — traffic lights and right-of-way (`traffic_lights=False` restores
-   the original 46-D task)
-3. collectible items (reward shaping with optional detours)
-4. static parked cars — `Lidar.scan()` already accepts an `obstacles` array of
-   circles and `_ray_circle_ranges` is written and vectorised, just unused
-5. rule-based moving traffic
+2. **done** — traffic lights and right-of-way
+3. **done** — static parked cars at the kerb
+4. **done** — rule-based moving traffic. `traffic=False` gives back the 53-D
+   lights-only task and adding `traffic_lights=False` gives back the original 46-D
+   one, so nothing here is load-bearing for the earlier stages.
+5. collectible items (reward shaping with optional detours)
 6. multi-agent
 
 `tasks/` is reserved for pulling reward and termination out of `nav_env.py` once

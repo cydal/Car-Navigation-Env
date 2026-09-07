@@ -70,7 +70,15 @@ class Traffic:
     """
 
     DS = 1.0                # route resample spacing, metres
-    LANE_OFFSET = 2.0       # lane centre, metres right of the corridor centre
+    # Lane centre, metres right of the corridor centre. Not a styling choice: a
+    # 12 m corridor holds two 1.9 m flows, so at 2.0 m an ego on the centre line
+    # passes oncoming traffic with 0.10 m to spare on each side, which no steering
+    # controller can hold -- four separate ego-side fixes (extra braking, swept
+    # forward room, a standing keep-right bias, an oncoming dodge) all failed
+    # because they were attacking the wrong variable. At 3.0 m the gap is 1.10 m
+    # each side, and it is the largest value that still clears the parked cars
+    # (kerb inset 1.10 m leaves their inner edge exactly 3.95 m out).
+    LANE_OFFSET = 3.0
     FILLET = 6.0            # tangent length of the corner-rounding curve
     A_ACCEL = 2.2           # gentle pull-away
     A_DECEL = 6.0           # braking authority: finite, so traffic *can* fail
@@ -443,7 +451,7 @@ class Traffic:
         target = self.route_v[rows, self._idx]
         target = np.minimum(target, self.cruise)
         target = np.minimum(target, self._signal_target(lights, geom))
-        target = np.minimum(target, self._junction_target(geom))
+        target = np.minimum(target, self._junction_target(geom, car))
         target = np.minimum(target, self._follow_target(car))
 
         dv = target - self.speed[:n]
@@ -509,7 +517,7 @@ class Traffic:
         v = np.where(claims, np.sqrt(2.0 * self.A_DECEL * room), np.inf)
         return v.min(axis=1)
 
-    def _junction_target(self, geom):
+    def _junction_target(self, geom, car):
         """Speed cap from one-vehicle-at-a-time reservation of each junction.
 
         Only 6 of ~56 crossings carry signals, so without this traffic simply
@@ -524,6 +532,16 @@ class Traffic:
         *crossing* traffic counts -- a vehicle in the same lane is a follower, and
         making it wait for the junction to clear as well would turn every platoon
         into single-file stop-start.
+
+        **The ego is in this lattice too.** Without it, a vehicle drives through an
+        ego sitting in a junction at full cruise: `_follow_target` is the only thing
+        that sees the ego at all and it is same-lane longitudinal, so an ego crossing
+        at 90 degrees is invisible to every part of the traffic model. That made
+        crossing conflicts the largest single category of ego collision, 22 of 43,
+        at a mean ego speed of 4.2 m/s -- i.e. the ego was the slower party in most
+        of them. The rule applied is exactly the one traffic already uses on itself,
+        the box belongs to whoever is inside it, so the ego still has to judge a gap
+        to enter; it just is not T-boned once it is committed and cannot retreat.
 
         Each vehicle is reduced to two junction indices before any pairwise work:
         the box it is inside (at most one -- boxes are 12 m across and no two
@@ -557,7 +575,17 @@ class Traffic:
         held = cross & (mine == j_in[None, :])
         beaten = (cross & (mine == j_next[None, :])
                   & (d[None, :] < d[:, None]))
-        blocked = approaching & (held | beaten).any(axis=1)
+
+        # Same reservation, with the ego as the holder. It only ever *holds* a box,
+        # never wins an approach race, so the ego gains no priority it has not
+        # already taken by being there.
+        e_box = ((np.abs(self._nodes[:, 0] - car.x) < half)
+                 & (np.abs(self._nodes[:, 1] - car.y) < half))
+        e_in = int(np.argmax(e_box)) if e_box.any() else -1
+        e_cross = np.abs(-(car.x - self.x[:n]) * s + (car.y - self.y[:n]) * c) > 1.2
+        held_ego = e_cross & (j_next == e_in) & (e_in >= 0)
+
+        blocked = approaching & ((held | beaten).any(axis=1) | held_ego)
 
         room = np.maximum(0.0, d - self.STOP_MARGIN)
         return np.where(blocked, np.sqrt(2.0 * self.A_DECEL * room), np.inf)

@@ -51,8 +51,9 @@ class GapFollower:
         tl_stop_margin=2.0,
         n_traffic_obs=4,
         traffic_obs_range=60.0,
-        follow_lat=2.5,
         follow_gap=4.0,
+        conflict_pad=1.5,
+        conflict_horizon=3.0,
     ):
         self.n_beams = n_beams
         self.n_lookahead = n_lookahead
@@ -61,9 +62,11 @@ class GapFollower:
         self.tl_stop_margin = tl_stop_margin  # metres to stop short of the stop line
         self.n_traffic_obs = n_traffic_obs
         self.traffic_obs_range = traffic_obs_range
-        self.follow_lat = follow_lat          # lateral window for "in my path"
         self.follow_gap = follow_gap          # bumper gap held in a queue
+        self.conflict_pad = conflict_pad      # reaction slack on the contact footprint
+        self.conflict_horizon = conflict_horizon # seconds ahead we plan over
         self.car_length = car_length
+        self.car_width = car_width
         self.lidar_range = lidar_range
         self.max_speed = max_speed
         self.max_steer = max_steer
@@ -93,8 +96,6 @@ class GapFollower:
             hl / np.maximum(np.abs(np.cos(self.offsets)), eps),
             hw / np.maximum(np.abs(np.sin(self.offsets)), eps),
         )
-
-        self.half_width = car_width / 2.0
 
         # Side beams, for measuring how far off-centre we are in a street.
         deg = np.degrees(self.offsets)
@@ -168,54 +169,71 @@ class GapFollower:
         room = max(0.0, to_line - self.tl_stop_margin)
         return float(np.sqrt(2.0 * self.brake_decel * room))
 
-    def _traffic_follow_speed(self, traf, speed):
-        """Speed to hold behind the nearest vehicle in our own path, or None.
+    def _traffic_conflict_speed(self, traf, speed):
+        """Speed cap for the nearest vehicle we are on course to hit, or None.
 
-        LIDAR already slows the car for traffic -- the vehicles are in the scan --
-        but the result is floored at `min_speed`, so the car creeps into whatever
-        it has stopped behind. Queueing needs a genuine zero, exactly like a red
-        light, and for the same reason: the floor exists to stop dithering in a
-        corridor, not to forbid stopping.
+        This is the term the traffic block exists for. LIDAR already reports
+        vehicles as geometry, but geometry cannot say whether the car ahead is
+        stopped or pulling away, and it says nothing at all about one that will be
+        in our path in two seconds and is not in it yet. Given relative velocity, a
+        constant-velocity closest-approach test covers the queue ahead and the car
+        crossing a junction with the same arithmetic -- and it filters itself: a
+        vehicle that will be long gone by the time we arrive has a large miss
+        distance and is ignored, without needing a rule for that case.
 
-        Only vehicles travelling *with* us count. An oncoming car sits inside the
-        lateral window too on a 12 m undivided corridor, and halting for one would
-        freeze the baseline at every passing car; both parties keeping right is
-        what resolves that, which the corridor centering term already does.
+        The cap can be zero, which is why it is applied below the `min_speed` floor
+        -- queueing needs a genuine halt, exactly like a red light.
+
+        What counts as "on course to hit" cannot be a single radius. Contact between
+        two 4.4 x 1.9 m cars happens at 1.90 m of lateral separation when their axes
+        are parallel but at 3.15 m when they are perpendicular, because it is then
+        our flank against their *length*. One isotropic threshold is wrong in both
+        directions at once: at 2.6 m it missed crossing conflicts (8 of 23 crossing
+        crashes had the detector reporting no conflict on the very step of impact),
+        and raising it to 3.15 would instead brake for every car passing in the
+        other lane, which sits 3.0 m away by construction. The relative velocity
+        gives the other vehicle's axis in our frame, so the tolerance is keyed on
+        that -- the same instinct as the three-circle body model: what we test
+        against has to be the shape we actually collide with.
         """
         if traf.size < 5:
             return None
+        hl, hw = self.car_length / 2.0, self.car_width / 2.0
         best = None
         for i in range(0, traf.size - 4, 5):
             sin_b, cos_b = float(traf[i + 1]), float(traf[i + 2])
             if sin_b == 0.0 and cos_b == 0.0:
                 continue                        # padded empty slot, not a vehicle
             d = float(traf[i]) * self.traffic_obs_range
-            fwd, lat = d * cos_b, d * sin_b
-            if fwd <= 0.0 or abs(lat) > self.follow_lat:
+            px, py = d * cos_b, d * sin_b       # ego frame: +x forward, +y right
+            if px <= 0.0:
+                continue                        # behind us; not ours to avoid
+            vx = float(traf[i + 3]) * self.max_speed
+            vy = float(traf[i + 4]) * self.max_speed
+            vv = vx * vx + vy * vy
+            # Time of closest approach, clamped to the horizon we plan over. Zero
+            # relative velocity means the gap never changes, so the answer is now.
+            t = 0.0 if vv < 1e-6 else max(0.0, min(self.conflict_horizon,
+                                                   -(px * vx + py * vy) / vv))
+            # Its velocity in our frame, hence its axis: ours is (speed, 0).
+            ax, ay = vx + speed, vy
+            an = np.hypot(ax, ay)
+            perp = abs(ay) / an if an > 1e-6 else 0.0   # 0 = parallel, 1 = square on
+            # Its extent across each of our axes, assuming it is our size -- the
+            # observation does not carry its dimensions, and that is the right
+            # assumption on average over the fleet.
+            tol_lat = 2.0 * hw + (hl - hw) * perp + self.conflict_pad
+            tol_lon = hl + hw + (hl - hw) * (1.0 - perp) + self.conflict_pad
+            mx, my = px + vx * t, py + vy * t
+            if (mx / tol_lon) ** 2 + (my / tol_lat) ** 2 > 1.0:
                 continue
-            # The block carries velocity *relative to us*; add our own back to get
-            # the leader's, which is what sets how slowly we have to end up going.
-            v_lead = float(traf[i + 3]) * self.max_speed + speed
-            if v_lead < -0.5:
-                continue                        # closing head-on: not a leader
-            room = max(0.0, fwd - self.car_length - self.follow_gap)
-            v = float(np.sqrt(max(0.0, v_lead) ** 2 + 2.0 * self.brake_decel * room))
+            # Its speed along our axis: what we have to end up matching. Negative
+            # means closing head-on, and then only stopping short of it will do.
+            v_lead = max(0.0, vx + speed)
+            room = max(0.0, px - self.car_length - self.follow_gap)
+            v = float(np.sqrt(v_lead ** 2 + 2.0 * self.brake_decel * room))
             best = v if best is None else min(best, v)
         return best
-
-    def _forward_room(self, eff):
-        """How far the car can carry straight on before its body meets something.
-
-        A fixed forward cone is wrong at both ends: at 20 m a 25 deg cone spans
-        wider than a 12 m street and calls the far kerb an obstacle, while a single
-        beam misses a car sitting half a lane over. Project each beam's hit into the
-        car's frame instead and keep the ones landing inside a body-width corridor
-        ahead -- the same swept test `world.sample_free_pose` uses for spawn poses.
-        """
-        fwd = eff * np.cos(self.offsets)
-        lat = np.abs(eff * np.sin(self.offsets))
-        blocking = (fwd > 0.0) & (lat < self.half_width + 0.3)
-        return float(fwd[blocking].min()) if blocking.any() else self.lidar_range
 
     def _windowed_clearance(self, eff):
         """Shrink each beam's range to the min of itself and its neighbours.
@@ -271,10 +289,20 @@ class GapFollower:
         delta = np.arctan(curvature * self.wheelbase)
         steer = float(np.clip(delta / self.max_steer, -1.0, 1.0))
 
-        # --- corridor centering: balance the room either side.
-        # Without this the goal term drags the car diagonally across a street
-        # until a corner clips a facade -- the centre stays on road the whole way,
-        # so nothing else in the controller ever objects.
+        # --- corridor centering from left/right LIDAR asymmetry.
+        # Without this the goal term drags the car diagonally across a street until
+        # a corner clips a facade -- the centre stays on road the whole way, so
+        # nothing else in the controller ever objects.
+        #
+        # Centring, not keeping right, even though traffic drives 3 m right of the
+        # centre line and head-on impacts were at the time the largest single
+        # collision category (17 of 56, before the lane offset was widened).
+        # A right-hand bias was tried and is *worse*, monotonically:
+        # 22.5% -> 14.5% -> 8.5% full-route success at bias 0 / 1.5 / 2.0 m, with
+        # building crashes climbing 95 -> 106 -> 122 and vehicle crashes flat at
+        # 56 / 59 / 56. On a 12 m corridor the ego is 1.9 m wide and these beams see
+        # the *nearest* thing on each side, which includes parked cars at the kerb,
+        # so a right bias trades a head-on it does not actually avoid for a facade.
         room_r = float(eff[self.right_mask].min()) if self.right_mask.any() else np.inf
         room_l = float(eff[self.left_mask].min()) if self.left_mask.any() else np.inf
         in_corridor = room_r < self.corridor_thresh and room_l < self.corridor_thresh
@@ -293,26 +321,13 @@ class GapFollower:
         v_safe = np.sqrt(2.0 * self.brake_decel * room)
         v_turn = self.cruise_speed * (1.0 - 0.45 * abs(steer))
 
-        # The `min_speed` floor exists to stop the car dithering to a halt in an
-        # open corridor, so it applies to the *comfort* terms only. Every constraint
-        # that comes from something real -- LIDAR clearance, a red light, a queue
-        # ahead -- has to be able to command an actual zero. With the floor applied
-        # after them the car rolled into whatever it had stopped for at 2 m/s, which
-        # is how 20 of 35 vehicle collisions happened to a target it had been
-        # tracking straight ahead for 15+ steps.
-        target = float(np.clip(min(self.cruise_speed, v_turn),
+        # The `min_speed` floor is a creep allowance, not a comfort setting: a
+        # kinematic car cannot turn on the spot, so one that stops dead facing a
+        # facade can never aim itself away and sits there until the episode times
+        # out. Constraints that require a genuine halt -- a red light, a queue --
+        # are applied below it, deliberately.
+        target = float(np.clip(min(self.cruise_speed, v_safe, v_turn),
                                self.min_speed, self.cruise_speed))
-        target = min(target, float(v_safe))
-
-        # Speed has to respect where the car is actually *going*, not only where it
-        # has decided to aim. Those coincide closely enough among static buildings,
-        # which is why this was never noticed, but they diverge by more than 5 m on
-        # 44% of steps: a vehicle stopped straight ahead while the controller aims
-        # 40 deg off to take a turn left the speed term reading open road. Six of
-        # eight sampled collisions were at 7-9 m/s with 1-3 m of clearance in front
-        # of the bumper and 20-35 m along the chosen heading.
-        room_f = max(0.0, self._forward_room(eff) - self.stop_margin)
-        target = min(target, float(np.sqrt(2.0 * self.brake_decel * room_f)))
 
         # Both of these gate on their slice being present in the observation rather
         # than on a constructor flag, so the controller adapts to an env with or
@@ -321,9 +336,9 @@ class GapFollower:
         if v_light is not None:
             target = min(target, v_light)
 
-        v_follow = self._traffic_follow_speed(traf, speed)
-        if v_follow is not None:
-            target = min(target, v_follow)
+        v_traffic = self._traffic_conflict_speed(traf, speed)
+        if v_traffic is not None:
+            target = min(target, v_traffic)
 
         err = target - speed
         if err > 0.25:
@@ -348,7 +363,7 @@ class GapFollower:
             "centering": centering,
             "in_corridor": in_corridor,
             "v_light": v_light,
-            "v_follow": v_follow,
+            "v_traffic": v_traffic,
         }
 
         # Env expects every channel in [-1, 1]; throttle/brake are rescaled to [0, 1].

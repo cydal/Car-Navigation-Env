@@ -43,6 +43,12 @@ def cmd_spec(args):
     print(f"  {c.n_beams:>3} lidar        360 deg, {c.lidar_range:.0f} m range, normalised to [0,1]")
     print(f"  {5:>3} dynamics     speed, yaw rate, steer angle, accel, slip")
     print(f"  {3*c.n_lookahead:>3} navigation   {c.n_lookahead} waypoints x (dist, sin, cos) of bearing")
+    if c.n_tl_obs:
+        print(f"  {7*c.n_tl_obs:>3} lights       {c.n_tl_obs} x (dist to stop line, sin, cos, "
+              f"red, yellow, green, steps to change)")
+    if c.n_traffic_obs:
+        print(f"  {5*c.n_traffic_obs:>3} traffic      nearest {c.n_traffic_obs} moving vehicles x "
+              f"(dist, sin, cos, rel vx, rel vy)")
     print(f"  {env.vector_dim:>3} total        ego-centric only -- no absolute position or heading")
     print()
     print("ACTION  Box(-1, 1, (3,))   throttle, brake, steer  (throttle/brake rescaled to [0,1])")
