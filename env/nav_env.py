@@ -13,6 +13,8 @@ Design notes
   path when rendering becomes the bottleneck.
 """
 
+import copy
+
 import numpy as np
 
 from .world import ProceduralCity, CityConfig
@@ -53,31 +55,61 @@ def _box(low, high, shape, dtype=np.float32):
 _BaseEnv = gym.Env if _HAS_GYM else object
 
 
+TL_FEATURES = 7   # per signal exposed in the observation; see _tl_features
+
+
 class TrafficLight:
-    """Two-phase signal: N-S green then E-W green, with yellow transitions."""
-    GREEN_STEPS  = 80   # simulation steps per green phase
-    YELLOW_STEPS = 12   # simulation steps per yellow phase
+    """Two-phase signal at one crossing: N-S green, then E-W green, with yellows.
+
+    Timings are set by the car's braking physics, not by realism. Yellow must be
+    at least as long as it takes to stop from cruising speed (10 m/s at the
+    controller's 6 m/s^2 is 1.67 s), or the warning is one a vehicle physically
+    cannot honour and yellow is decoration. 40 steps at dt=0.05 is 2.0 s.
+
+    Green is deliberately short for an RL env: a full cycle is 280 steps = 14 s,
+    so a 1000-step episode sees ~3.6 cycles and the agent actually encounters
+    every phase instead of meeting one light state per episode.
+    """
+
+    GREEN_STEPS  = 100  # 5.0 s at dt=0.05
+    YELLOW_STEPS = 40   # 2.0 s -- exceeds the 1.67 s stop from cruise speed
+
+    # phase 0 = NS green, 1 = NS yellow, 2 = EW green, 3 = EW yellow
+    _NS = ('green', 'yellow', 'red', 'red')
+    _EW = ('red', 'red', 'green', 'yellow')
 
     def __init__(self, x, y, phase=0, timer=0):
         self.x = x
         self.y = y
-        self.phase = phase  # 0=NS-green, 1=NS-yellow, 2=EW-green, 3=EW-yellow
+        self.phase = phase
         self.timer = timer
 
+    @property
+    def phase_limit(self):
+        return self.YELLOW_STEPS if self.phase % 2 == 1 else self.GREEN_STEPS
+
     def tick(self):
-        limit = self.YELLOW_STEPS if self.phase % 2 == 1 else self.GREEN_STEPS
         self.timer += 1
-        if self.timer >= limit:
+        if self.timer >= self.phase_limit:
             self.phase = (self.phase + 1) % 4
             self.timer = 0
 
+    def state(self, axis):
+        """Signal shown to traffic travelling along `axis` ('ns' or 'ew')."""
+        return (self._NS if axis == 'ns' else self._EW)[self.phase]
+
+    @property
+    def steps_remaining(self):
+        """Steps until this phase ends -- what makes the light anticipatable."""
+        return self.phase_limit - self.timer
+
     @property
     def ns_state(self):
-        return ('green', 'yellow', 'red', 'red')[self.phase]
+        return self._NS[self.phase]
 
     @property
     def ew_state(self):
-        return ('red', 'red', 'green', 'yellow')[self.phase]
+        return self._EW[self.phase]
 
 
 class EnvConfig:
@@ -105,9 +137,10 @@ class EnvConfig:
         target_bonus=100.0,
         stuck_speed=0.5,
         stuck_steps=150,
+        # --- traffic lights
+        traffic_lights=True,
         red_light_penalty=50.0,
-        # --- traffic-light observation (0 = off, keeps the default 46-dim vector)
-        n_tl_obs=0,
+        n_tl_obs=None,          # None = 1 when lights are on, else 0
         tl_obs_range=60.0,
     ):
         self.n_targets = n_targets              # waypoints per episode
@@ -129,8 +162,11 @@ class EnvConfig:
         self.target_bonus = target_bonus
         self.stuck_speed = stuck_speed
         self.stuck_steps = stuck_steps
+        # Penalising a light the agent cannot see would be unlearnable, so the
+        # penalty and the observation block are driven by one switch.
+        self.traffic_lights = traffic_lights
         self.red_light_penalty = red_light_penalty
-        self.n_tl_obs = n_tl_obs                # nearest TLs in obs; 0 = off
+        self.n_tl_obs = (1 if traffic_lights else 0) if n_tl_obs is None else n_tl_obs
         self.tl_obs_range = tl_obs_range
 
 
@@ -170,7 +206,15 @@ class CarNavEnv(_BaseEnv):
         self._renderer = renderer
 
         self.rng = np.random.default_rng(seed)
-        self.city = ProceduralCity(city_config or CityConfig(), seed=seed)
+        city_cfg = city_config or CityConfig()
+        # The renderer draws signal masts from `city.signals`, so if the city kept
+        # signals while the task had them switched off, the pixel observation would
+        # show lights that never change and that the vector observation and reward
+        # know nothing about. One switch, one city.
+        if not self.cfg.traffic_lights and city_cfg.max_signals:
+            city_cfg = copy.copy(city_cfg)   # never mutate a caller's config
+            city_cfg.max_signals = 0
+        self.city = ProceduralCity(city_cfg, seed=seed)
         self.car = Car(car_params or CarParams())
         self.lidar = Lidar(
             n_beams=self.cfg.n_beams,
@@ -195,7 +239,7 @@ class CarNavEnv(_BaseEnv):
         # --- spaces
         self.action_space = _box(-1.0, 1.0, (3,))
         self.vector_dim = (self.cfg.n_beams + 5 + 3 * self.cfg.n_lookahead
-                           + 6 * self.cfg.n_tl_obs)
+                           + TL_FEATURES * self.cfg.n_tl_obs)
         vec_space = _box(-1.0, 1.0, (self.vector_dim,))
         img_space = _box(0, 255, (image_size, image_size, 3), np.uint8)
         if obs_type == "vector":
@@ -220,11 +264,12 @@ class CarNavEnv(_BaseEnv):
         if self.cfg.randomize_map:
             self.city.generate()
 
-        # Stagger phases so not every intersection turns green simultaneously.
+        # Only the sparse signalised subset gets lights, and phases are staggered
+        # so the agent meets different states rather than one synchronised city.
         self.traffic_lights = [
-            TrafficLight(x, y, phase=i % 4, timer=(i * 23) % TrafficLight.GREEN_STEPS)
-            for i, (x, y) in enumerate(self.city.intersections)
-        ]
+            TrafficLight(x, y, phase=i % 4, timer=(i * 23) % TrafficLight.YELLOW_STEPS)
+            for i, (x, y) in enumerate(self.city.signals)
+        ] if self.cfg.traffic_lights else []
 
         x, y, heading = self.city.sample_free_pose(self.car.p.length, self.car.p.width)
         self.car.reset(x, y, heading)
@@ -270,6 +315,7 @@ class CarNavEnv(_BaseEnv):
         terminated = False
         crashed = False
         reached = 0
+        prev_x, prev_y = self.car.x, self.car.y   # for entry-arm resolution below
 
         for _ in range(cfg.action_repeat):
             self.car.step(throttle, brake, steer, cfg.dt)
@@ -296,19 +342,21 @@ class CarNavEnv(_BaseEnv):
                     break
                 self.prev_dist = self._dist_to_target()
 
-        # Red-light violation: one-shot penalty when the car enters an intersection
-        # zone while the relevant signal is red.  Checked before ticking so the car
-        # experiences the phase it sees this step, not the next one.
+        # Red-light violation: one-shot penalty when the car crosses the stop line
+        # into an intersection while the signal for its approach is red. Checked
+        # before ticking so the car is judged on the phase it actually saw.
+        #
+        # Only entry is penalised, never occupancy: a light turning red while you
+        # are already in the box is not a violation, and charging per-step would
+        # make one mistake unboundedly expensive.
         if not terminated and self.traffic_lights:
-            half_road = (self.city.cfg.road_width / 2.0) * self.city.tile_size
-            h = self.car.heading
-            ns_direction = abs(np.sin(h)) > abs(np.cos(h))
+            half = self._zone_half
             for i, tl in enumerate(self.traffic_lights):
-                in_zone = (abs(self.car.x - tl.x) < half_road and
-                           abs(self.car.y - tl.y) < half_road)
+                in_zone = (abs(self.car.x - tl.x) < half and
+                           abs(self.car.y - tl.y) < half)
                 if in_zone and i not in self._in_intersection:
-                    state = tl.ns_state if ns_direction else tl.ew_state
-                    if state == 'red':
+                    axis = self._entry_axis(tl, prev_x, prev_y, half)
+                    if tl.state(axis) == 'red':
                         reward -= cfg.red_light_penalty
                         self.red_light_violations += 1
                 if in_zone:
@@ -323,8 +371,13 @@ class CarNavEnv(_BaseEnv):
         # Idling is discouraged by the time penalty; cutting the episode short
         # here only saves compute. The remaining penalty is charged as a lump sum
         # so early termination carries no reward-shaping side effect.
+        # Waiting at a red is not being stuck. Without this exemption the stuck
+        # detector and the signal timings are silently coupled: a red lasts
+        # GREEN+YELLOW steps, so any cycle longer than stuck_steps would terminate
+        # the episode *for obeying the law*.
         if not terminated and cfg.stuck_steps:
-            self.stuck_count = self.stuck_count + 1 if self.car.speed < cfg.stuck_speed else 0
+            idle = self.car.speed < cfg.stuck_speed
+            self.stuck_count = self.stuck_count + 1 if (idle and not self._waiting_at_red()) else 0
             if self.stuck_count >= cfg.stuck_steps:
                 remaining = max(0, cfg.max_episode_steps - self.step_count)
                 reward -= cfg.time_penalty * remaining * cfg.action_repeat
@@ -351,6 +404,57 @@ class CarNavEnv(_BaseEnv):
         tx, ty = self.targets[self.target_idx]
         return float(np.hypot(tx - self.car.x, ty - self.car.y))
 
+    # ------------------------------------------------------------------
+    # Traffic lights
+    # ------------------------------------------------------------------
+    @property
+    def _zone_half(self):
+        """Half-width of an intersection box; its edges are the stop lines."""
+        return (self.city.cfg.road_width / 2.0) * self.city.tile_size
+
+    @staticmethod
+    def _entry_axis(tl, prev_x, prev_y, half):
+        """Which axis of traffic the car joined, from the arm it entered through.
+
+        Deciding this from instantaneous heading instead (|sin h| > |cos h|) is a
+        coin flip whenever the car is near 45 degrees -- measured at 7% of real
+        entries, with 11% within 20 degrees. That turns the penalty itself into
+        noise the agent cannot learn from. The arm the car came *through* is
+        unambiguous and is fixed at the moment the penalty is evaluated.
+        """
+        was_out_y = abs(prev_y - tl.y) >= half
+        was_out_x = abs(prev_x - tl.x) >= half
+        if was_out_y and not was_out_x:
+            return 'ns'                    # crossed a north/south stop line
+        if was_out_x and not was_out_y:
+            return 'ew'
+        # Corner case (both/neither outside): fall back to travel direction.
+        return 'ns' if abs(prev_y - tl.y) > abs(prev_x - tl.x) else 'ew'
+
+    @staticmethod
+    def _approach_axis(tl, x, y):
+        """Axis the car will enter on, from where the crossing lies relative to it.
+
+        Used for the observation, where entry has not happened yet. Displacement
+        to the crossing is far steadier than heading -- approaching down a
+        corridor, the crossing is squarely ahead on that corridor's axis -- and it
+        agrees with `_entry_axis` by construction.
+        """
+        return 'ns' if abs(y - tl.y) > abs(x - tl.x) else 'ew'
+
+    def _waiting_at_red(self):
+        """True if the car is legitimately held at a red it is approaching."""
+        if not self.traffic_lights:
+            return False
+        half = self._zone_half
+        x, y = self.car.x, self.car.y
+        for tl in self.traffic_lights:
+            # Near the stop line, on the approach, and facing a red.
+            if (abs(x - tl.x) < half + 12.0 and abs(y - tl.y) < half + 12.0
+                    and tl.state(self._approach_axis(tl, x, y)) == 'red'):
+                return True
+        return False
+
     def vector_obs(self):
         scan = self.lidar.scan(self.city, self.car.x, self.car.y, self.car.heading)
         dyn = dynamics_features(self.car)
@@ -359,50 +463,61 @@ class CarNavEnv(_BaseEnv):
         return np.concatenate([scan, dyn, nav, self._tl_features()]).astype(np.float32)
 
     def _tl_features(self):
-        """Encode the n_tl_obs nearest traffic lights into the observation vector.
+        """Encode the n_tl_obs nearest signals, ego-centrically, in [-1, 1].
 
-        Per light (6 values, all in [-1, 1] or [0, 1]):
-            dist_norm   normalised distance (0 = at light, 1 = at/beyond tl_obs_range)
-            sin_bearing ego-centric bearing to the intersection
+        Per signal (TL_FEATURES values):
+            dist_norm    distance to the stop line / tl_obs_range, 0 at the line
+            sin_bearing  ego-centric bearing to the crossing
             cos_bearing
-            red         1 if the relevant signal is red, else 0
-            yellow      1 if yellow
-            green       1 if green
+            red          one-hot state for *this car's approach axis*
+            yellow
+            green
+            time_norm    steps until the phase changes, / GREEN_STEPS
 
-        The relevant signal is NS if |sin(heading)| > |cos(heading)|, else EW.
-        Absent / out-of-range lights are padded with (1, 0, 0, 0, 0, 1) — far, green.
+        `time_norm` is what makes the light anticipatable rather than a surprise:
+        it is the difference between "stop" and "it will be green before you get
+        there", and it is the latent a world model should learn to roll forward.
+
+        Distance is measured to the *stop line*, not the crossing centre, because
+        that is where the decision has to be taken.
+
+        Absent or out-of-range signals pad with green at full distance, which no
+        real approaching red can produce, so "no signal" stays distinguishable.
         """
         n = self.cfg.n_tl_obs
-        if n == 0 or not self.traffic_lights:
-            return np.zeros(6 * n, dtype=np.float32)
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
 
         car = self.car
         r = self.cfg.tl_obs_range
-        ns_dir = abs(np.sin(car.heading)) > abs(np.cos(car.heading))
+        half = self._zone_half
+        pad = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
 
-        ranked = sorted(
-            self.traffic_lights,
-            key=lambda tl: (tl.x - car.x) ** 2 + (tl.y - car.y) ** 2
-        )
+        ranked = sorted(self.traffic_lights,
+                        key=lambda tl: (tl.x - car.x) ** 2 + (tl.y - car.y) ** 2)
 
         out = []
         for k in range(n):
-            if k < len(ranked):
-                tl = ranked[k]
-                dist = float(np.hypot(tl.x - car.x, tl.y - car.y))
-                if dist < r:
-                    bearing = np.arctan2(tl.y - car.y, tl.x - car.x) - car.heading
-                    state = tl.ns_state if ns_dir else tl.ew_state
-                    out += [
-                        float(dist / r),
-                        float(np.sin(bearing)),
-                        float(np.cos(bearing)),
-                        float(state == 'red'),
-                        float(state == 'yellow'),
-                        float(state == 'green'),
-                    ]
-                    continue
-            out += [1.0, 0.0, 0.0, 0.0, 0.0, 1.0]   # pad: far, green
+            if k >= len(ranked):
+                out += pad
+                continue
+            tl = ranked[k]
+            dx, dy = tl.x - car.x, tl.y - car.y
+            to_line = max(0.0, float(np.hypot(dx, dy)) - half)
+            if to_line >= r:
+                out += pad
+                continue
+            bearing = np.arctan2(dy, dx) - car.heading
+            state = tl.state(self._approach_axis(tl, car.x, car.y))
+            out += [
+                float(to_line / r),
+                float(np.sin(bearing)),
+                float(np.cos(bearing)),
+                float(state == 'red'),
+                float(state == 'yellow'),
+                float(state == 'green'),
+                float(min(1.0, tl.steps_remaining / TrafficLight.GREEN_STEPS)),
+            ]
 
         return np.array(out, dtype=np.float32)
 

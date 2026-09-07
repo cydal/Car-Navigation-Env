@@ -35,6 +35,8 @@ class CityConfig:
         block_segment_prob=0.10,
         plaza_prob=0.10,
         max_plaza=4,
+        max_signals=6,
+        signal_min_sep=45.0,
     ):
         self.width = width                          # grid columns
         self.height = height                        # grid rows
@@ -46,6 +48,12 @@ class CityConfig:
         self.block_segment_prob = block_segment_prob  # chance a street segment is walled off
         self.plaza_prob = plaza_prob                # chance a block becomes an open plaza
         self.max_plaza = max_plaza                  # cap on plazas per map
+        # Only a handful of crossings get signals. Every 4-way intersection sits
+        # ~29 m from the next, so lighting them all turns a drive into stop-go
+        # every 3 s with no rhythm to learn; a sparse spread makes each signal an
+        # event instead of constant friction.
+        self.max_signals = max_signals              # cap on signalised crossings
+        self.signal_min_sep = signal_min_sep        # metres between signalised crossings
 
 
 class ProceduralCity:
@@ -59,7 +67,8 @@ class ProceduralCity:
         self.height = self.cfg.height
         self.grid = None
         self.road_cells = None      # (N, 2) array of (row, col) reachable road tiles
-        self.intersections = []     # (x, y) world-space centres of road crossings
+        self.intersections = []     # (x, y) world-space centres of every 4-way crossing
+        self.signals = []           # the sparse subset of those that get traffic lights
         self.generate()
 
     # ------------------------------------------------------------------
@@ -94,12 +103,14 @@ class ProceduralCity:
                 self.grid = grid
                 self.road_cells = cells
                 self.intersections = self._find_intersections(grid, v_roads, h_roads)
+                self.signals = self._choose_signals(self.intersections)
                 return
 
         # Fall back to whatever the last attempt produced rather than looping forever.
         self.grid = grid
         self.road_cells = cells
         self.intersections = self._find_intersections(grid, v_roads, h_roads)
+        self.signals = self._choose_signals(self.intersections)
 
     def _find_intersections(self, grid, v_roads, h_roads):
         """Return world-space (x, y) centres of true 4-way road crossings.
@@ -134,6 +145,26 @@ class ProceduralCity:
                     float((hy + rw / 2) * ts),
                 ))
         return result
+
+    def _choose_signals(self, candidates):
+        """Pick a spatially spread subset of crossings to signalise.
+
+        Greedy farthest-first over a shuffled candidate list, so signals land on
+        different streets rather than clustering along one corridor.
+        """
+        cfg = self.cfg
+        if not candidates or cfg.max_signals <= 0:
+            return []
+        order = self.rng.permutation(len(candidates))
+        chosen = []
+        for i in order:
+            x, y = candidates[i]
+            if all((x - cx) ** 2 + (y - cy) ** 2 >= cfg.signal_min_sep ** 2
+                   for cx, cy in chosen):
+                chosen.append((x, y))
+                if len(chosen) >= cfg.max_signals:
+                    break
+        return chosen
 
     def _road_positions(self, extent):
         """Pick corridor start indices spaced by randomised block widths."""

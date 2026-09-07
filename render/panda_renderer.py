@@ -397,17 +397,47 @@ class PandaRenderer:
     # Traffic lights
     # ------------------------------------------------------------------
 
+    # Approaches, in Panda's Y-mirrored world. For each: the direction of travel,
+    # the corner the mast stands on (signs of x, y offsets from the crossing
+    # centre) and the axis of traffic it governs.
+    #
+    # The mast sits on the near-right corner of the approach and the arm reaches
+    # left, out over the middle of the corridor, so the head hangs above the stop
+    # line facing back down the approach -- the one place an approaching driver is
+    # already looking. A single pole in one corner (the previous design) shows its
+    # edge or its back from most approaches and cannot be read at all from two.
+    _TL_APPROACHES = (
+        # (travel dx, travel dy, corner x sign, corner y sign, axis)
+        (0.0,  1.0,  1.0, -1.0, 'ns'),   # northbound: enters from -Y
+        (0.0, -1.0, -1.0,  1.0, 'ns'),   # southbound: enters from +Y
+        (1.0,  0.0, -1.0, -1.0, 'ew'),   # eastbound:  enters from -X
+        (-1.0, 0.0,  1.0,  1.0, 'ew'),   # westbound:  enters from +X
+    )
+
+    # Signal-head geometry, metres.
+    _MAST_H    = 5.6    # mast height; head hangs below, well clear of the car
+    _MAST_W    = 0.22
+    _ARM_Z     = 5.4    # underside of the horizontal arm
+    _ARM_T     = 0.14   # arm thickness
+    _HEAD_TOP  = 5.15
+    _LAMP_H    = 0.30
+    _LAMP_GAP  = 0.09
+    _LAMP_HALF = 0.19   # lamp half-extent across the face
+    _PLATE_D   = 0.07   # backplate thickness
+    _PROUD     = 0.06   # how far the lens stands out in front of the backplate
+
     def _setup_traffic_lights(self, city):
-        """One pole per 4-way intersection with two direction-specific signal heads.
+        """Build one overhead signal head per approach at every signalised crossing.
 
-        Each pole sits in the NW corner of the crossing.  A horizontal arm extends
-        east (+X in Panda, for N-S traffic) and another extends south (-Y, for E-W
-        traffic).  A signal plate hangs at each arm end.
+        Four masts per crossing, one per approach, each on the near-right corner
+        with the arm reaching out over the corridor so the head sits above the stop
+        line facing oncoming traffic. Northbound/southbound heads show the N-S
+        phase, eastbound/westbound the E-W phase, so the signal a driver is looking
+        at is always the one that governs them -- there is nothing to disambiguate.
 
-        Lamp visibility fix: lamps are *wider* than the plate in the perpendicular
-        direction so their side-faces protrude past the plate and are visible from
-        any horizontal angle.  The NS head shows the NS phase; the EW head shows
-        the EW phase independently.
+        Lens visibility: the lens box stands `_PROUD` metres in front of its
+        backplate, so the driver sees its full front face. The previous design
+        buried the lamps inside a housing box, which occluded every face of them.
         """
         for static_np, lamp_nps in self._tl_nps:
             static_np.removeNode()
@@ -416,104 +446,92 @@ class PandaRenderer:
         self._tl_nps = []
         self._tl_lamp_nps = []
 
-        if not city.intersections:
+        signals = getattr(city, "signals", None) or []
+        if not signals:
             return
 
-        half_road = (city.cfg.road_width / 2.0) * city.tile_size
-        inset = 1.2
+        half = (city.cfg.road_width / 2.0) * city.tile_size
+        mw = self._MAST_W / 2
+        plate_h = 3 * self._LAMP_H + 2 * self._LAMP_GAP + 0.14
+        plate_z0 = self._HEAD_TOP - plate_h
+        MAST_COL  = (0.17, 0.17, 0.18, 1)
+        PLATE_COL = (0.07, 0.07, 0.08, 1)
+        DIM = [(0.20, 0.03, 0.03, 1), (0.20, 0.16, 0.03, 1), (0.03, 0.20, 0.03, 1)]
 
-        POST_W   = 0.20
-        POST_H   = 4.2
-        ARM_L    = 0.35
-        PLATE_D  = 0.08   # plate depth in the face direction
-        PLATE_W  = 0.36   # plate width perpendicular to face
-        LAMP_H   = 0.28
-        LAMP_W   = 0.26   # half-width; total 0.52 > plate 0.36 → protrudes 8 cm per side
-        LAMP_GAP = 0.08
-        LAMP_Z_OFF = 0.07
-        PLATE_H  = 3 * LAMP_H + 2 * LAMP_GAP + 2 * LAMP_Z_OFF   # ≈ 1.14 m
+        for cx, cy in signals:
+            px, py = cx, -cy          # crossing centre in Panda's Y-mirrored world
+            static_parts = []
+            heads = {'ns': [], 'ew': []}
 
-        POST_COL  = (0.16, 0.16, 0.16, 1)
-        ARM_COL   = (0.20, 0.20, 0.20, 1)
-        PLATE_COL = (0.09, 0.09, 0.09, 1)
-        DIM = [(0.22, 0.04, 0.04, 1), (0.22, 0.18, 0.04, 1), (0.04, 0.22, 0.04, 1)]
+            for tdx, tdy, sx, sy, axis in self._TL_APPROACHES:
+                # Mast on the near-right corner of this approach.
+                mx, my = px + sx * half, py + sy * half
+                static_parts.append(_box_mesh(
+                    (mx - mw, my - mw, 0.0), (mx + mw, my + mw, self._MAST_H), MAST_COL))
 
-        hw  = POST_W / 2
-        pz0 = POST_H - PLATE_H   # bottom of signal plates
+                # Head hangs over the corridor centreline, at the stop line: step
+                # back from the crossing centre along the approach's travel axis.
+                hx = px - tdx * half
+                hy = py - tdy * half
 
-        for cx, cy in city.intersections:
-            pan_x = cx - half_road + inset
-            pan_y = -cy + half_road - inset
+                # Arm spans from the mast across to the head position.
+                ax0, ax1 = sorted((mx, hx))
+                ay0, ay1 = sorted((my, hy))
+                static_parts.append(_box_mesh(
+                    (ax0 - mw, ay0 - mw, self._ARM_Z),
+                    (ax1 + mw, ay1 + mw, self._ARM_Z + self._ARM_T), MAST_COL))
 
-            static_parts = [
-                _box_mesh((pan_x - hw, pan_y - hw, 0.0),
-                          (pan_x + hw, pan_y + hw, POST_H), POST_COL),
-            ]
+                # Backplate is perpendicular to travel; lenses face -travel.
+                lat = self._LAMP_HALF + 0.05           # plate half-width across face
+                if axis == 'ns':
+                    plate_lo = (hx - lat, hy - tdy * self._PLATE_D if tdy > 0 else hy, plate_z0)
+                    plate_hi = (hx + lat, hy if tdy > 0 else hy + self._PLATE_D, self._HEAD_TOP)
+                else:
+                    plate_lo = (hx - tdx * self._PLATE_D if tdx > 0 else hx, hy - lat, plate_z0)
+                    plate_hi = (hx if tdx > 0 else hx + self._PLATE_D, hy + lat, self._HEAD_TOP)
+                static_parts.append(_box_mesh(plate_lo, plate_hi, PLATE_COL))
 
-            # NS arm extends east (+X), plate faces +X
-            ns_ax1 = pan_x + hw + ARM_L
-            static_parts += [
-                _box_mesh((pan_x + hw, pan_y - 0.05, POST_H - 0.12),
-                          (ns_ax1,    pan_y + 0.05, POST_H), ARM_COL),
-                _box_mesh((ns_ax1,            pan_y - PLATE_W / 2, pz0),
-                          (ns_ax1 + PLATE_D,  pan_y + PLATE_W / 2, POST_H), PLATE_COL),
-            ]
-            ns_px = ns_ax1   # lamp reference: plate back face
-
-            # EW arm extends south (-Y), plate faces -Y
-            ew_ay0 = pan_y - hw - ARM_L
-            static_parts += [
-                _box_mesh((pan_x - 0.05, ew_ay0,    POST_H - 0.12),
-                          (pan_x + 0.05, pan_y - hw, POST_H), ARM_COL),
-                _box_mesh((pan_x - PLATE_W / 2, ew_ay0 - PLATE_D, pz0),
-                          (pan_x + PLATE_W / 2, ew_ay0,            POST_H), PLATE_COL),
-            ]
-            ew_py = ew_ay0   # lamp reference: plate front face (most-negative Y)
+                # Three lenses, red on top, standing proud of the plate face.
+                lamps = []
+                for j in range(3):
+                    lz0 = plate_z0 + 0.07 + (2 - j) * (self._LAMP_H + self._LAMP_GAP)
+                    lz1 = lz0 + self._LAMP_H
+                    h = self._LAMP_HALF
+                    if axis == 'ns':
+                        # faces -tdy: lens sits on the oncoming side of the plate
+                        y_face = hy - tdy * self._PLATE_D
+                        lo = (hx - h, min(y_face, y_face - tdy * self._PROUD), lz0)
+                        hi = (hx + h, max(y_face, y_face - tdy * self._PROUD), lz1)
+                    else:
+                        x_face = hx - tdx * self._PLATE_D
+                        lo = (min(x_face, x_face - tdx * self._PROUD), hy - h, lz0)
+                        hi = (max(x_face, x_face - tdx * self._PROUD), hy + h, lz1)
+                    ln = _mesh_to_node(f"tl_{axis}{j}", _box_mesh(lo, hi, DIM[j]))
+                    ln.reparentTo(self.base.render)
+                    ln.setLightOff()      # reads as self-illuminated, not shaded
+                    lamps.append(ln)
+                heads[axis].append(lamps)
 
             static_np = _mesh_to_node("tl_static", np.concatenate(static_parts))
             static_np.reparentTo(self.base.render)
 
-            ns_lamps, ew_lamps = [], []
-            for j in range(3):   # j=0 red (top), j=1 yellow (mid), j=2 green (bottom)
-                lz0 = pz0 + LAMP_Z_OFF + (2 - j) * (LAMP_H + LAMP_GAP)
+            flat = [ln for hs in heads.values() for lamps in hs for ln in lamps]
+            self._tl_nps.append((static_np, flat))
+            self._tl_lamp_nps.append(heads)
 
-                # NS lamp: same X depth as plate, wider in Y → side-faces protrude
-                ns_verts = _box_mesh(
-                    (ns_px,           pan_y - LAMP_W, lz0),
-                    (ns_px + PLATE_D, pan_y + LAMP_W, lz0 + LAMP_H), DIM[j])
-                ns_ln = _mesh_to_node(f"tl_ns{j}", ns_verts)
-                ns_ln.reparentTo(self.base.render)
-                ns_ln.setLightOff()
-                ns_lamps.append(ns_ln)
-
-                # EW lamp: same Y depth as plate, wider in X → side-faces protrude
-                ew_verts = _box_mesh(
-                    (pan_x - LAMP_W, ew_py - PLATE_D, lz0),
-                    (pan_x + LAMP_W, ew_py,           lz0 + LAMP_H), DIM[j])
-                ew_ln = _mesh_to_node(f"tl_ew{j}", ew_verts)
-                ew_ln.reparentTo(self.base.render)
-                ew_ln.setLightOff()
-                ew_lamps.append(ew_ln)
-
-            self._tl_nps.append((static_np, ns_lamps + ew_lamps))
-            self._tl_lamp_nps.append((ns_lamps, ew_lamps))
-
-    # Bright / dim colours: index 0=red, 1=yellow, 2=green
-    _TL_ON  = [(1.00, 0.06, 0.04, 1), (1.00, 0.88, 0.04, 1), (0.08, 1.00, 0.08, 1)]
-    _TL_OFF = [(0.22, 0.04, 0.04, 1), (0.22, 0.18, 0.04, 1), (0.04, 0.22, 0.04, 1)]
+    # Bright / dim colours: index 0 = red, 1 = yellow, 2 = green
+    _TL_ON  = [(1.00, 0.06, 0.04, 1), (1.00, 0.88, 0.04, 1), (0.10, 1.00, 0.12, 1)]
+    _TL_OFF = [(0.20, 0.03, 0.03, 1), (0.20, 0.16, 0.03, 1), (0.03, 0.20, 0.03, 1)]
+    _TL_ORDER = ('red', 'yellow', 'green')
 
     def _update_traffic_lights(self, env):
-        tls = getattr(env, 'traffic_lights', [])
-        for tl, (ns_lamps, ew_lamps) in zip(tls, self._tl_lamp_nps):
-            for j, (on, off) in enumerate(zip(self._TL_ON, self._TL_OFF)):
-                ns_active = (j == 0 and tl.ns_state == 'red')    or \
-                            (j == 1 and tl.ns_state == 'yellow') or \
-                            (j == 2 and tl.ns_state == 'green')
-                ew_active = (j == 0 and tl.ew_state == 'red')    or \
-                            (j == 1 and tl.ew_state == 'yellow') or \
-                            (j == 2 and tl.ew_state == 'green')
-                ns_lamps[j].setColor(*(on if ns_active else off))
-                ew_lamps[j].setColor(*(on if ew_active else off))
+        for tl, heads in zip(getattr(env, 'traffic_lights', []), self._tl_lamp_nps):
+            for axis, head_list in heads.items():
+                state = tl.state(axis)
+                for lamps in head_list:
+                    for j, name in enumerate(self._TL_ORDER):
+                        lamps[j].setColor(
+                            *(self._TL_ON[j] if state == name else self._TL_OFF[j]))
 
     # ------------------------------------------------------------------
     def build_scene(self, city):

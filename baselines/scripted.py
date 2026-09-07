@@ -46,9 +46,15 @@ class GapFollower:
         min_speed=2.0,
         brake_decel=6.0,
         stop_margin=3.5,
+        n_tl_obs=0,
+        tl_obs_range=60.0,
+        tl_stop_margin=2.0,
     ):
         self.n_beams = n_beams
         self.n_lookahead = n_lookahead
+        self.n_tl_obs = n_tl_obs
+        self.tl_obs_range = tl_obs_range
+        self.tl_stop_margin = tl_stop_margin  # metres to stop short of the stop line
         self.lidar_range = lidar_range
         self.max_speed = max_speed
         self.max_steer = max_steer
@@ -92,9 +98,30 @@ class GapFollower:
 
     # ------------------------------------------------------------------
     def unpack(self, obs):
-        """Split the flat observation back into its three blocks."""
+        """Split the flat observation into scan / dynamics / nav / traffic-light."""
         n = self.n_beams
-        return obs[:n], obs[n:n + 5], obs[n + 5:]
+        nav_end = n + 5 + 3 * self.n_lookahead
+        return obs[:n], obs[n:n + 5], obs[n + 5:nav_end], obs[nav_end:]
+
+    def _red_light_stop_speed(self, tl):
+        """Target speed to hold for the nearest signal, or None if it is not ours.
+
+        Only reds and yellows ahead of the car matter. A signal that is already
+        behind us (cos_bearing <= 0) or that we are inside the box of has no claim
+        on us -- braking to a halt mid-intersection would be worse than clearing it.
+        """
+        if tl.size < 7:
+            return None
+        to_line = float(tl[0]) * self.tl_obs_range
+        cos_b = float(tl[2])
+        red, yellow = float(tl[3]), float(tl[4])
+        if (red < 0.5 and yellow < 0.5) or cos_b <= 0.3:
+            return None
+        # Already committed: past the stop line, so keep going and clear the box.
+        if to_line <= 0.2:
+            return None
+        room = max(0.0, to_line - self.tl_stop_margin)
+        return float(np.sqrt(2.0 * self.brake_decel * room))
 
     def _windowed_clearance(self, eff):
         """Shrink each beam's range to the min of itself and its neighbours.
@@ -109,7 +136,7 @@ class GapFollower:
         return float(clear[idx])
 
     def act(self, obs):
-        scan, dyn, nav = self.unpack(obs)
+        scan, dyn, nav, tl = self.unpack(obs)
         speed = float(dyn[0]) * self.max_speed
         bearing = float(np.arctan2(nav[1], nav[2]))
 
@@ -173,6 +200,15 @@ class GapFollower:
         v_turn = self.cruise_speed * (1.0 - 0.45 * abs(steer))
         target = float(np.clip(min(self.cruise_speed, v_safe, v_turn), self.min_speed, self.cruise_speed))
 
+        # A red light is the one case where a full stop is correct, so it has to
+        # bypass the min_speed floor -- that floor exists to stop the car dithering
+        # in a corridor, and applying it here would make obeying a red impossible.
+        # Gated on the slice actually being present, not on a constructor flag, so
+        # the controller adapts to an env with or without lights without retuning.
+        v_light = self._red_light_stop_speed(tl)
+        if v_light is not None:
+            target = min(target, v_light)
+
         err = target - speed
         if err > 0.25:
             throttle, brake = min(1.0, err / 2.5), 0.0
@@ -195,6 +231,7 @@ class GapFollower:
             "min_clear": float(clear.min()),
             "centering": centering,
             "in_corridor": in_corridor,
+            "v_light": v_light,
         }
 
         # Env expects every channel in [-1, 1]; throttle/brake are rescaled to [0, 1].
