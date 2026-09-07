@@ -28,6 +28,8 @@ from panda3d.core import loadPrcFileData
 loadPrcFileData("", "audio-library-name null")   # no sound device, faster startup
 loadPrcFileData("", "sync-video 0")              # never block on vsync
 loadPrcFileData("", "notify-level-display error")
+loadPrcFileData("", "framebuffer-multisample 1") # MSAA on
+loadPrcFileData("", "multisamples 4")            # 4× samples
 
 from panda3d.core import (  # noqa: E402
     AmbientLight, CardMaker, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
@@ -47,7 +49,7 @@ VERTEX_DTYPE = np.dtype([("v", "<f4", 3), ("n", "<f4", 3), ("c", "<f4", 4)])
 # A quad's four corners expand to two triangles in this order.
 _QUAD_TO_TRIS = np.array([0, 1, 2, 0, 2, 3])
 
-SKY = (0.53, 0.62, 0.74)
+SKY = (0.52, 0.64, 0.82)
 
 _BASE = None        # ShowBase is a process-wide singleton in Panda3D.
 
@@ -179,15 +181,24 @@ class PandaRenderer:
     # ------------------------------------------------------------------
     def _setup_lights(self):
         render = self.base.render
+        # Cool blue-sky ambient — represents diffuse light from the open sky.
         amb = AmbientLight("amb")
-        amb.setColor(Vec4(0.45, 0.47, 0.52, 1))
+        amb.setColor(Vec4(0.28, 0.32, 0.42, 1))
         render.setLight(render.attachNewNode(amb))
 
+        # Warm golden key light — late-afternoon sun from the south-west.
         sun = DirectionalLight("sun")
-        sun.setColor(Vec4(0.85, 0.82, 0.75, 1))
+        sun.setColor(Vec4(0.92, 0.82, 0.60, 1))
         sun_np = render.attachNewNode(sun)
         sun_np.setHpr(-35, -55, 0)
         render.setLight(sun_np)
+
+        # Weak cool fill from the opposite side — softens harsh shadow faces.
+        fill = DirectionalLight("fill")
+        fill.setColor(Vec4(0.10, 0.13, 0.20, 1))
+        fill_np = render.attachNewNode(fill)
+        fill_np.setHpr(145, -20, 0)
+        render.setLight(fill_np)
 
         # Hides the map boundary and gives the flat grid some depth cueing.
         fog = Fog("fog")
@@ -452,6 +463,34 @@ class PandaRenderer:
                      axis=1),
             np.tile(np.array([(0, 0, 1)], dtype=np.float32), (len(grows), 1)),
             road_col))
+
+        # Curbs: narrow raised concrete strips along every building-road boundary.
+        # They use the same road-neighbour masks as the building walls above.
+        cw_f = np.float32(0.28)   # curb width in metres
+        ch_f = np.float32(0.14)   # curb height in metres
+        ch_a = np.full(len(rows), ch_f, dtype=np.float32)
+        curb_col = np.tile(np.array([0.60, 0.58, 0.55, 1.0], dtype=np.float32),
+                           (len(rows), 1))
+        cym, cyp = y0 - cw_f, y1 + cw_f  # south / north outer edges
+        cxm, cxp = x0 - cw_f, x1 + cw_f  # west  / east  outer edges
+        south = ~neighbour_solid(-1, 0)
+        north = ~neighbour_solid(1,  0)
+        west  = ~neighbour_solid(0, -1)
+        east  = ~neighbour_solid(0,  1)
+        # top faces (normal +Z) — follow the same CCW-in-physics-XY convention as roofs
+        parts += [
+            quad([(x0, cym, ch_a), (x1, cym, ch_a), (x1, y0, ch_a), (x0, y0, ch_a)], (0, 0, 1), curb_col, south),
+            quad([(x0, y1, ch_a), (x1, y1, ch_a), (x1, cyp, ch_a), (x0, cyp, ch_a)], (0, 0, 1), curb_col, north),
+            quad([(cxm, y0, ch_a), (x0, y0, ch_a), (x0, y1, ch_a), (cxm, y1, ch_a)], (0, 0, 1), curb_col, west),
+            quad([(x1, y0, ch_a), (cxp, y0, ch_a), (cxp, y1, ch_a), (x1, y1, ch_a)], (0, 0, 1), curb_col, east),
+        ]
+        # outer faces (road-side vertical faces) — same winding as the matching wall normals
+        parts += [
+            quad([(x0, cym, z0), (x1, cym, z0), (x1, cym, ch_a), (x0, cym, ch_a)], (0, -1, 0), curb_col, south),
+            quad([(x1, cyp, z0), (x0, cyp, z0), (x0, cyp, ch_a), (x1, cyp, ch_a)], (0,  1, 0), curb_col, north),
+            quad([(cxm, y1, z0), (cxm, y0, z0), (cxm, y0, ch_a), (cxm, y1, ch_a)], (-1, 0, 0), curb_col, west),
+            quad([(cxp, y0, z0), (cxp, y1, z0), (cxp, y1, ch_a), (cxp, y0, ch_a)], ( 1, 0, 0), curb_col, east),
+        ]
 
         city_verts = np.concatenate(parts)
         # Physics Y increases "screen-down" (map convention); Panda3D is right-hand
