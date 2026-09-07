@@ -308,12 +308,22 @@ class PandaRenderer:
         self._mm_np.attachNewNode(brd.create()).setLightOff()
 
         # Waypoint squares — repositioned each frame, 8 slots for any task size.
+        #
+        # The explicit sort is not cosmetic tidiness. Two waypoints in one route can
+        # be metres apart (non-consecutive pairs come within 0.9 m; only *consecutive*
+        # hops are guaranteed ≥40 m), and then their cards coincide on the minimap.
+        # Coplanar siblings with equal sort draw in an order Panda does not promise to
+        # keep stable, so the current target rendered green in one process and was
+        # covered by a later yellow card in the next — the same seed and step giving
+        # two different images. Slot 0 is the current target, so it gets the highest
+        # sort and is drawn last: the square you are steering towards is never hidden.
         sq = 0.015
-        for _ in range(8):
+        for i in range(8):
             cm3 = CardMaker("mm_wpt")
             cm3.setFrame(-sq, sq, -sq, sq)
             wpt = self._mm_np.attachNewNode(cm3.generate())
             wpt.setLightOff()
+            wpt.setBin("fixed", 8 - i)
             wpt.hide()
             self._mm_wpt_nps.append(wpt)
 
