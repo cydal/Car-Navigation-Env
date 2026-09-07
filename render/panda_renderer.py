@@ -133,14 +133,16 @@ class PandaRenderer:
 
     def __init__(self, offscreen=True, size=64, fov=60.0,
                  cam_dist=13.0, cam_height=6.5, look_ahead=9.0, smooth=0.0,
-                 build_min=6.0, build_max=24.0, show_rays=False, show_minimap=None):
+                 build_min=6.0, build_max=24.0, show_rays=None, show_minimap=None):
         self.size = (size, size) if isinstance(size, int) else tuple(size)
         self.offscreen = offscreen
         self.cam_dist = cam_dist
         self.cam_height = cam_height
         self.look_ahead = look_ahead
         self.smooth = smooth          # 0 = stateless (required for training)
-        self.show_rays = show_rays    # LIDAR overlay; debug/visualisation only
+        # Proximity ring defaults on for onscreen windows, off for offscreen so
+        # it never appears in training image observations.
+        self.show_rays = show_rays if show_rays is not None else (not offscreen)
         # Minimap is on by default for onscreen (demo) windows, off for offscreen
         # (training image captures) so the map overlay never enters training obs.
         self.show_minimap = show_minimap if show_minimap is not None else (not offscreen)
@@ -207,7 +209,7 @@ class PandaRenderer:
             model.reparentTo(self.car_np)
             # The Kenney sedan faces +Y after glTF load; our world forward is +X.
             # setH(-90) on the sub-node rotates the nose from +Y to +X.
-            model.setH(-90)
+            model.setH(90)
             # Sedan bounding box: Y=2.55 m long.  Scale so length ≈ 4.4 m.
             model.setScale(1.72)
         else:
@@ -507,11 +509,10 @@ class PandaRenderer:
                 np_.hide()
 
     def _draw_rays(self, env):
-        """Overlay the LIDAR scan. Debug aid only -- off during training.
+        """Proximity ring in the 3D scene.  Green = clear, red = close.
 
-        Always clears the previous frame's node first, including when the overlay
-        has just been switched off -- otherwise a stale fan of rays stays frozen
-        in the scene pointing where the car used to be.
+        Always clears first so a stale ring never stays frozen when the
+        overlay is switched off between frames.
         """
         if self._rays_np is not None:
             self._rays_np.removeNode()
@@ -519,14 +520,21 @@ class PandaRenderer:
         lidar = getattr(env, "lidar", None)
         if not self.show_rays or lidar is None:
             return
+        min_dist = float(np.min(lidar.last_distances))
+        t = np.clip(min_dist / lidar.max_range, 0.0, 1.0)
         segs = LineSegs()
-        segs.setThickness(1.6)
-        hx, hy = lidar.hit_points(env.car.x, env.car.y, env.car.heading)
-        for i in range(len(hx)):
-            frac = lidar.last_distances[i] / lidar.max_range
-            segs.setColor(1.0 - frac, 0.25 + 0.7 * frac, 0.35, 1)
-            segs.moveTo(env.car.x, env.car.y, 1.0)
-            segs.drawTo(float(hx[i]), float(hy[i]), 1.0)
+        segs.setThickness(2.5)
+        segs.setColor(1.0 - t, t, 0.05, 0.9)
+        radius = 3.0   # world metres, outside the car body
+        N = 48
+        cx, cy = env.car.x, env.car.y
+        for i in range(N + 1):
+            a = 2.0 * np.pi * i / N
+            px, py = cx + np.cos(a) * radius, cy + np.sin(a) * radius
+            if i == 0:
+                segs.moveTo(px, py, 0.5)
+            else:
+                segs.drawTo(px, py, 0.5)
         self._rays_np = self.base.render.attachNewNode(segs.create())
         self._rays_np.setLightOff()
 
