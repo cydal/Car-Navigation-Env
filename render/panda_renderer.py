@@ -21,6 +21,8 @@ Two design constraints drove the implementation:
    watching, not for training.
 """
 
+import os
+
 import numpy as np
 from panda3d.core import loadPrcFileData
 
@@ -30,6 +32,20 @@ loadPrcFileData("", "sync-video 0")              # never block on vsync
 loadPrcFileData("", "notify-level-display error")
 loadPrcFileData("", "framebuffer-multisample 1") # MSAA on
 loadPrcFileData("", "multisamples 4")            # 4× samples
+
+# Headless GPU boxes (no X server -- $DISPLAY unset) can't create a GLX
+# context: Panda3D's default pipe needs a display to connect to, fails
+# ("Could not open display"), and silently falls back to a software
+# rasterizer that doesn't support modern shaders (glTF/GLB PBR materials
+# from kenney_car-kit render as flat gray instead of their real textures,
+# and calling setShaderAuto() aborts the process -- "shader profile not
+# supported"). p3headlessgl uses EGL to get a real GPU-backed context
+# without any display server -- verified working on this box's NVIDIA T4
+# via libEGL_nvidia. Only takes this path when there's truly no display,
+# so a normal desktop/laptop with a running X/Wayland session (GLX already
+# works there) is unaffected.
+if not os.environ.get("DISPLAY"):
+    loadPrcFileData("", "load-display p3headlessgl")
 
 from panda3d.core import (  # noqa: E402
     AmbientLight, CardMaker, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
@@ -50,6 +66,25 @@ VERTEX_DTYPE = np.dtype([("v", "<f4", 3), ("n", "<f4", 3), ("c", "<f4", 4)])
 _QUAD_TO_TRIS = np.array([0, 1, 2, 0, 2, 3])
 
 SKY = (0.52, 0.64, 0.82)
+
+# Fallback vehicle-box colors when kenney_car-kit/ isn't installed. Saturated
+# and mutually distinct, deliberately far from the desaturated blue-gray
+# building palette in build_scene (base_col: shade in [0.42, 0.72] * (0.98,
+# 0.95, 0.90)) so a vehicle never visually merges with a wall behind it. One
+# per env.traffic.VEHICLE_KINDS entry (indexed mod length, so any future kind
+# still gets a distinct-looking color instead of an IndexError).
+_FALLBACK_VEHICLE_COLORS = (
+    (0.85, 0.15, 0.12, 1),  # sedan -- red
+    (0.95, 0.55, 0.05, 1),  # sedan-sports -- orange
+    (0.95, 0.85, 0.05, 1),  # hatchback-sports -- yellow
+    (0.10, 0.55, 0.20, 1),  # suv -- green
+    (0.05, 0.65, 0.60, 1),  # suv-luxury -- teal
+    (0.10, 0.35, 0.85, 1),  # taxi -- blue
+    (0.35, 0.10, 0.75, 1),  # police -- violet
+    (0.85, 0.15, 0.55, 1),  # van -- magenta
+    (0.60, 0.40, 0.15, 1),  # delivery -- brown
+    (0.90, 0.90, 0.90, 1),  # truck -- near-white (still lighter than any wall shade)
+)
 
 _BASE = None        # ShowBase is a process-wide singleton in Panda3D.
 
@@ -574,15 +609,42 @@ class PandaRenderer:
         if os.path.exists(glb):
             model = self.base.loader.loadModel(glb)
             lo, hi = model.getTightBounds()
-            raw = float(hi[1] - lo[1])            # Kenney models face +Y on load
+            # Kenney models face +Y on load: native X = width, Y = length, Z = height.
+            raw_x = float(hi[0] - lo[0])
+            raw_y = float(hi[1] - lo[1])
+            raw_z = float(hi[2] - lo[2])
             model.reparentTo(holder)
             model.setH(90)                        # nose from +Y to our +X
-            if raw > 1e-3:
-                holder.setScale(length / raw)
+            # BUG (found by tracing a parked "taxi" that rendered as an 8m-tall,
+            # 4.4m-wide slab instead of a car): a single uniform holder.setScale(
+            # length / raw) scaled ALL THREE axes by the length ratio alone. For
+            # any model whose raw width/height don't happen to be proportioned
+            # like its length (taxi.glb: raw X=Y=1.5 -- a square footprint before
+            # scaling), width and height came out equal to the scaled length
+            # instead of the vehicle's actual width/a normal car height. Scale
+            # each axis to its own physical target instead. After setH(90),
+            # holder's X is the (now-rotated) length axis and Y is width, per
+            # the comment above; TARGET_HEIGHT matches the no-asset box fallback
+            # a few lines down so both code paths agree on car height.
+            TARGET_HEIGHT = 1.35
+            sx = length / raw_y if raw_y > 1e-3 else 1.0
+            sy = width / raw_x if raw_x > 1e-3 else 1.0
+            sz = TARGET_HEIGHT / raw_z if raw_z > 1e-3 else 1.0
+            holder.setScale(sx, sy, sz)
         else:                                     # keep working without the asset pack
+            # Building walls are desaturated blue-gray (base_col in build_scene:
+            # shade in [0.42, 0.72], RGB ~ shade*(0.98, 0.95, 0.90)) -- the old
+            # fallback box color (0.55, 0.57, 0.62) sits right in that range, so a
+            # parked car viewed close and edge-on visually merges with the wall
+            # behind it (looks like "car embedded in building" even though the
+            # physics position/collision is correct -- verified separately via
+            # env.city.collides with the vehicle's true oriented footprint).
+            # Saturated, mutually-distinct colors per kind fix the ambiguity and
+            # incidentally make traffic read as more varied.
+            color = _FALLBACK_VEHICLE_COLORS[kind % len(_FALLBACK_VEHICLE_COLORS)]
             _mesh_to_node(f"veh_box_{stem}", _box_mesh(
                 (-length / 2, -width / 2, 0.0), (length / 2, width / 2, 1.35),
-                (0.55, 0.57, 0.62, 1))).reparentTo(holder)
+                color)).reparentTo(holder)
 
         self._veh_protos[kind] = holder
         return holder
