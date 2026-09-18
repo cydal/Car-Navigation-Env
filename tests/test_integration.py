@@ -176,7 +176,7 @@ print("terminated vs truncated decides whether a learner bootstraps V(s').\n")
 # Each of the four endings is provoked deliberately rather than hoped for: an
 # absent case would otherwise pass its assertion by default.
 seen, both = {}, 0
-PARK = np.array([-1.0, 1.0, 0.0], dtype=np.float32)
+PARK = np.array([0.0, 1.0, 0.0], dtype=np.float32)   # zero throttle, full brake: held at 0
 FLOOR = np.array([1.0, -1.0, 0.0], dtype=np.float32)
 
 
@@ -217,7 +217,7 @@ for env in (a, b):
     obs, info = env.reset(seed=31)
     t = 0.0
     while True:
-        obs, r, te, tr, info = env.step(np.array([-1.0, 1.0, 0.0], dtype=np.float32))
+        obs, r, te, tr, info = env.step(np.array([0.0, 1.0, 0.0], dtype=np.float32))
         t += r
         if te or tr:
             break

@@ -139,7 +139,7 @@ env = make_env(seed=12)
 env.reset(seed=12)
 total = 0.0
 for _ in range(env.cfg.max_episode_steps):
-    _, r, te, tr, info = env.step(np.array([-1.0, 1.0, 0.0]))  # no throttle, full brake
+    _, r, te, tr, info = env.step(np.array([0.0, 1.0, 0.0]))  # no throttle, full brake
     total += r
     if te or tr:
         break
