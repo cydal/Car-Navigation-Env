@@ -262,6 +262,23 @@ model's imagined scene in a separate overlay).  Set `show_rays=False` to
 suppress the ring; it is off by default in offscreen (training) mode so it
 never enters image observations.
 
+**Camera picture-in-picture (front / left / right)** — three extra corner
+thumbnails, each its own offscreen-rendered camera (front dash-cam, left/right
+wing-mirror-style views), composited onto the main window the same way the
+minimap is: a live texture on a bordered card. Set `show_cameras=False` (or
+`--no-cameras` on the CLI) to turn them off; like the ring and the minimap
+they default off for offscreen/training renderers.
+
+**Dashboard HUD** (`render/hud.py`) — dark cockpit-style panels reading
+straight off `env`/`info`: a big speed readout, an episode-reward panel with
+the live time/progress/target/red-light/crash breakdown (`info["reward_
+components"]`), and a sensors panel combining the LIDAR closest-obstacle
+reading with a per-sector **radar** readout (`env.radar` — nearest moving
+vehicle per compass sector, with distance and closing speed in km/h) and a
+countdown to the nearest traffic signal's next phase change. Colors and panel
+styling come from `render/theme.py`, shared with the restyled minimap and
+LIDAR ring.
+
 **Keyboard controls** (`--keys` flag):
 
 | key | action |

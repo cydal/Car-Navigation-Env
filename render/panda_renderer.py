@@ -22,6 +22,7 @@ Two design constraints drove the implementation:
 """
 
 import os
+import sys
 
 import numpy as np
 from panda3d.core import loadPrcFileData
@@ -33,25 +34,38 @@ loadPrcFileData("", "notify-level-display error")
 loadPrcFileData("", "framebuffer-multisample 1") # MSAA on
 loadPrcFileData("", "multisamples 4")            # 4× samples
 
-# Headless GPU boxes (no X server -- $DISPLAY unset) can't create a GLX
-# context: Panda3D's default pipe needs a display to connect to, fails
+# Headless *Linux* GPU boxes (no X server -- $DISPLAY unset) can't create a
+# GLX context: Panda3D's default pipe needs a display to connect to, fails
 # ("Could not open display"), and silently falls back to a software
 # rasterizer that doesn't support modern shaders (glTF/GLB PBR materials
 # from kenney_car-kit render as flat gray instead of their real textures,
 # and calling setShaderAuto() aborts the process -- "shader profile not
 # supported"). p3headlessgl uses EGL to get a real GPU-backed context
-# without any display server -- verified working on this box's NVIDIA T4
-# via libEGL_nvidia. Only takes this path when there's truly no display,
-# so a normal desktop/laptop with a running X/Wayland session (GLX already
-# works there) is unaffected.
-if not os.environ.get("DISPLAY"):
+# without any display server -- verified working on a cloud box's NVIDIA T4
+# via libEGL_nvidia.
+#
+# This is a Linux/X11-only problem. On macOS there is no $DISPLAY concept at
+# all -- Panda3D's default pipe is CocoaGraphicsPipe, which talks to the
+# WindowServer directly and needs no display variable, headless or not.
+# Gating on `sys.platform` (not just "$DISPLAY unset") matters because a Mac
+# running from a script/CI shell often has no $DISPLAY either -- checking
+# "$DISPLAY unset" alone would wrongly send it down the EGL branch, which
+# doesn't exist on macOS and fails outright ("No graphics pipe is available").
+# So: EGL only where it's the actual fix (headless Linux); everywhere else,
+# including a normal desktop/laptop with a running X/Wayland session (GLX
+# already works there), Panda3D picks its own default pipe unmodified.
+if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
     loadPrcFileData("", "load-display p3headlessgl")
 
 from panda3d.core import (  # noqa: E402
-    AmbientLight, CardMaker, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
-    GeomVertexArrayFormat, GeomVertexData, GeomVertexFormat, GraphicsOutput,
-    InternalName, LineSegs, NodePath, Texture, Vec3, Vec4,
+    AmbientLight, Camera, CardMaker, DirectionalLight, Fog, Geom, GeomNode,
+    GeomTriangles, GeomVertexArrayFormat, GeomVertexData, GeomVertexFormat,
+    GraphicsOutput, InternalName, LineSegs, NodePath, PerspectiveLens, Texture,
+    TextNode, Vec3, Vec4,
 )
+from direct.gui.OnscreenText import OnscreenText
+
+from . import theme
 
 # position + normal + rgba, all float32 -- matches VERTEX_DTYPE below byte for byte.
 _afmt = GeomVertexArrayFormat()
@@ -170,7 +184,8 @@ class PandaRenderer:
 
     def __init__(self, offscreen=True, size=64, fov=60.0,
                  cam_dist=13.0, cam_height=6.5, look_ahead=9.0, smooth=0.0,
-                 build_min=6.0, build_max=24.0, show_rays=None, show_minimap=None):
+                 build_min=6.0, build_max=24.0, show_rays=None, show_minimap=None,
+                 show_cameras=None):
         self.size = (size, size) if isinstance(size, int) else tuple(size)
         self.offscreen = offscreen
         self.cam_dist = cam_dist
@@ -183,6 +198,10 @@ class PandaRenderer:
         # Minimap is on by default for onscreen (demo) windows, off for offscreen
         # (training image captures) so the map overlay never enters training obs.
         self.show_minimap = show_minimap if show_minimap is not None else (not offscreen)
+        # Front/left/right picture-in-picture camera feeds -- same on/off-by-
+        # offscreen discipline as show_rays/show_minimap, for the same reason:
+        # they must never leak into a training image observation.
+        self.show_cameras = show_cameras if show_cameras is not None else (not offscreen)
         self.build_min = build_min
         self.build_max = build_max
 
@@ -214,6 +233,11 @@ class PandaRenderer:
         self._mm_extent = (1.0, 1.0)
         if self.show_minimap:
             self._setup_minimap_frame()
+
+        # Front/left/right camera picture-in-picture feeds (corner thumbnails).
+        self._pip = []
+        if self.show_cameras:
+            self._setup_pip_cameras()
 
         self._tex = None
         if offscreen:
@@ -322,7 +346,7 @@ class PandaRenderer:
         cm.setFrame(self._MM_X0 - pad, self._MM_X1 + pad,
                     self._MM_Z0 - pad, self._MM_Z1 + pad)
         bg = self._mm_np.attachNewNode(cm.generate())
-        bg.setColor(0.06, 0.07, 0.09, 1)
+        bg.setColor(*theme.BG_SOLID)
 
         # City texture quad (texture data filled on each build_scene).
         self._mm_city_tex = Texture("mm_city")
@@ -333,7 +357,7 @@ class PandaRenderer:
 
         # Border drawn on top of the city quad.
         brd = LineSegs()
-        brd.setColor(0.55, 0.58, 0.62, 1)
+        brd.setColor(*theme.BORDER)
         brd.setThickness(1.5)
         brd.moveTo(self._MM_X0, 0, self._MM_Z0)
         brd.drawTo(self._MM_X1, 0, self._MM_Z0)
@@ -422,7 +446,7 @@ class PandaRenderer:
         br_z = cz - fwd_z * sz * 0.6 - lft_z * sz * 0.6
 
         segs.setThickness(2.5)
-        segs.setColor(1.0, 0.38, 0.08, 1.0)
+        segs.setColor(*theme.ACCENT)
         segs.moveTo(bl_x, 0, bl_z)
         segs.drawTo(tip_x, 0, tip_z)
         segs.drawTo(br_x, 0, br_z)
@@ -438,11 +462,105 @@ class PandaRenderer:
                 tx, ty = pending[i]
                 mx, mz = self._world_to_mm(tx, ty)
                 wpt_np.setPos(mx, 0, mz)
-                wpt_np.setColor(*((0.22, 0.95, 0.38, 1) if i == 0
-                                  else (0.92, 0.76, 0.15, 1)))
+                wpt_np.setColor(*(theme.GOOD if i == 0 else theme.WARN))
                 wpt_np.show()
             else:
                 wpt_np.hide()
+
+    # ------------------------------------------------------------------
+    # Camera picture-in-picture feeds (front / left / right)
+    # ------------------------------------------------------------------
+
+    # Per view: (name, card frame in render2d NDC (x0,x1,z0,z1), buffer pixel
+    # size (w,h), vertical FOV, mount forward-offset (m), mount lateral offset
+    # (m, signed relative bearing in degrees, see `_panda_dir`), mount height
+    # (m), look relative bearing (degrees), look distance (m), look height (m).
+    #
+    # Mount/look directions are expressed as a bearing *relative to the car's
+    # heading* rather than raw Panda vectors, because `_panda_dir` already
+    # encodes the physics->Panda Y-mirror once, correctly, in one place -- the
+    # same derivation `_place_camera` relies on for the chase cam (panda
+    # forward = (cos h, -sin h)). Left/right use +/-90 deg here because, in this
+    # left-handed physics frame (x=east, y=south) mirrored into Panda's
+    # right-handed (east, north, up), true driver-left is heading-90 deg and
+    # driver-right is heading+90 deg -- verified against the h=0 (facing east)
+    # case, where left must be north (+Panda-y).
+    _PIP_SPECS = (
+        # name,    x0,    x1,    z0,    z1,     w,   h,  fov, fwd, lat_deg, lat, ht,   look_deg, look_d, look_z
+        ("front", -0.20,  0.20, -0.98, -0.68,  220, 172, 68.0, 1.8,     0.0, 0.0, 1.25,      0.0,  16.0, 0.7),
+        ("left",  -0.98, -0.58, -0.98, -0.74,  220, 143, 82.0, 0.6,   -90.0, 0.95, 0.90,   -60.0,   9.0, 0.2),
+        ("right",  0.58,  0.98, -0.98, -0.74,  220, 143, 82.0, 0.6,    90.0, 0.95, 0.90,    60.0,   9.0, 0.2),
+    )
+
+    @staticmethod
+    def _panda_dir(heading, rel_deg):
+        """Unit direction in Panda's (x, y) ground plane for a bearing that is
+        `rel_deg` degrees from the car's heading, physics convention."""
+        a = heading + np.radians(rel_deg)
+        return np.cos(a), -np.sin(a)
+
+    def _setup_pip_cameras(self):
+        """Build one offscreen render-to-texture buffer + camera per PiP view,
+        displayed as a bordered card under render2d -- the same texture-card
+        idiom the minimap already uses (`_setup_minimap_frame`), just fed by a
+        live camera instead of a raster upload."""
+        for spec in self._PIP_SPECS:
+            name, x0, x1, z0, z1, w, h, fov = spec[:8]
+            buffer = self.base.win.makeTextureBuffer(f"pip_{name}", w, h)
+            buffer.setSort(-100)          # render before the main window composites
+            buffer.setClearColorActive(True)
+            buffer.setClearColor(Vec4(*SKY, 1.0))
+
+            lens = PerspectiveLens()
+            lens.setFov(fov)
+            lens.setNear(0.3)
+            lens.setFar(400.0)
+            cam_node = Camera(f"pip_cam_{name}")
+            cam_node.setLens(lens)
+            cam_np = self.base.render.attachNewNode(cam_node)
+
+            dr = buffer.makeDisplayRegion()
+            dr.setCamera(cam_np)
+
+            tex = buffer.getTexture()
+            cm = CardMaker(f"pip_{name}_card")
+            cm.setFrame(x0, x1, z0, z1)
+            card_np = self.base.render2d.attachNewNode(cm.generate())
+            card_np.setTexture(tex)
+
+            _, border_np = theme.panel_card(
+                self.base.render2d, x0, x1, z0, z1,
+                bg_color=(0, 0, 0, 0), border_color=theme.BORDER, name=f"pip_{name}")
+
+            label_np = OnscreenText(
+                text=name.upper(), parent=self.base.render2d,
+                pos=((x0 + x1) / 2.0, z1 + 0.018), scale=0.028,
+                fg=theme.TEXT, shadow=(0, 0, 0, 0.7), align=TextNode.ACenter,
+                mayChange=False)
+
+            self._pip.append({
+                "spec": spec, "cam_np": cam_np, "card_np": card_np,
+                "border_np": border_np, "label_np": label_np, "buffer": buffer,
+            })
+
+    def _place_pip_cameras(self, env):
+        car = env.car
+        heading = float(car.heading)
+        cx, cy = car.x, -car.y  # car centre in Panda's Y-mirrored world
+
+        for pip in self._pip:
+            _, _, _, _, _, _, _, _, fwd, lat_deg, lat, ht, look_deg, look_d, look_z = pip["spec"]
+            fdx, fdy = self._panda_dir(heading, 0.0)
+            ldx, ldy = self._panda_dir(heading, lat_deg)
+            mx = cx + fdx * fwd + ldx * lat
+            my = cy + fdy * fwd + ldy * lat
+
+            gdx, gdy = self._panda_dir(heading, look_deg)
+            tx = mx + gdx * look_d
+            ty = my + gdy * look_d
+
+            pip["cam_np"].setPos(mx, my, ht)
+            pip["cam_np"].lookAt(tx, ty, look_z)
 
     # ------------------------------------------------------------------
     # Traffic lights
@@ -571,8 +689,8 @@ class PandaRenderer:
             self._tl_lamp_nps.append(heads)
 
     # Bright / dim colours: index 0 = red, 1 = yellow, 2 = green
-    _TL_ON  = [(1.00, 0.06, 0.04, 1), (1.00, 0.88, 0.04, 1), (0.10, 1.00, 0.12, 1)]
-    _TL_OFF = [(0.20, 0.03, 0.03, 1), (0.20, 0.16, 0.03, 1), (0.03, 0.20, 0.03, 1)]
+    _TL_ON  = theme.TL_ON
+    _TL_OFF = theme.TL_OFF
     _TL_ORDER = ('red', 'yellow', 'green')
 
     def _update_traffic_lights(self, env):
@@ -863,7 +981,7 @@ class PandaRenderer:
             rel = (-a - heading - np.pi) % (2.0 * np.pi)
             k = int(round(rel * n_beams / (2.0 * np.pi))) % n_beams
             t = float(np.clip(dists[k] / max_r, 0.0, 1.0))
-            segs.setColor(1.0 - t, t, 0.05, 0.9)
+            segs.setColor(*theme.lerp_color(theme.RANGE_NEAR, theme.RANGE_FAR, t))
             px = cx + np.cos(a) * radius
             py = cy + np.sin(a) * radius
             if i == 0:
@@ -889,6 +1007,8 @@ class PandaRenderer:
         self._update_traffic(env)
         if self.show_minimap:
             self._update_minimap(env)
+        if self.show_cameras:
+            self._place_pip_cameras(env)
 
     def capture(self, env, size=None):
         """Render one frame and return it as an (H, W, 3) uint8 array."""
@@ -934,3 +1054,11 @@ class PandaRenderer:
             self._mm_np.removeNode()
             self._mm_np = None
             self._mm_car_np = None
+        for pip in self._pip:
+            pip["cam_np"].removeNode()
+            pip["card_np"].removeNode()
+            if pip["border_np"] is not None:
+                pip["border_np"].removeNode()
+            pip["label_np"].destroy()
+            self.base.graphicsEngine.removeWindow(pip["buffer"])
+        self._pip = []

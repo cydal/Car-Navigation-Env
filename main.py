@@ -148,11 +148,10 @@ def cmd_shots(args):
 
 def cmd_demo(args):
     from render.panda_renderer import PandaRenderer
-    from direct.gui.OnscreenText import OnscreenText
-    from panda3d.core import TextNode
+    from render.hud import Hud
 
     renderer = PandaRenderer(offscreen=False, size=args.window, show_rays=not args.no_rays,
-                             smooth=args.smooth)
+                             show_cameras=not args.no_cameras, smooth=args.smooth)
     env = build_env(args, "vector", renderer=renderer)
     driver = make_driver(env)
     base = renderer.base
@@ -161,8 +160,7 @@ def cmd_demo(args):
     state["obs"], state["info"] = env.reset(seed=args.seed)
     driver.reset()
 
-    hud = OnscreenText(text="", pos=(-1.31, 0.92), scale=0.045, fg=(1, 1, 1, 1),
-                       shadow=(0, 0, 0, 0.7), align=TextNode.ALeft, mayChange=True)
+    hud = Hud(base)
 
     keys = {}
     for k in ("arrow_up", "arrow_down", "arrow_left", "arrow_right"):
@@ -191,13 +189,10 @@ def cmd_demo(args):
                       f"waypoints {state['info']['targets_reached']}/{env.cfg.n_targets}")
                 state["obs"], state["info"] = env.reset()
                 driver.reset()
-        i = state["info"]
-        hud.setText(
-            f"speed {i.get('speed', 0):5.1f} m/s   waypoint {i.get('targets_reached', 0)}/"
-            f"{env.cfg.n_targets}   dist {i.get('dist_to_target', 0):5.1f} m\n"
-            f"reward {i.get('episode_reward', 0):8.1f}   step {i.get('step', 0)}\n"
-            f"[{'manual' if state['manual'] else 'scripted'}]  "
-            f"space=pause  m=mode  r=reset  esc=quit")
+        hud.update(
+            env, state["info"],
+            mode_label="manual" if state["manual"] else "scripted",
+            controls_text="space=pause  m=mode  r=reset  esc=quit")
         return task.again
 
     print("demo running -- arrows drive (press m), space pauses, r resets, esc quits")
@@ -219,6 +214,8 @@ def main():
     ap.add_argument("--smooth", type=float, default=0.0,
                     help="camera smoothing for demo only; must stay 0 for training")
     ap.add_argument("--no-rays", action="store_true", help="hide the LIDAR overlay")
+    ap.add_argument("--no-cameras", action="store_true",
+                    help="hide the front/left/right camera picture-in-picture feeds")
     ap.add_argument("--keys", action="store_true",
                     help="demo: start in manual driving mode (arrow keys)")
     ap.add_argument("--every", type=int, default=70, help="shots: steps between frames")

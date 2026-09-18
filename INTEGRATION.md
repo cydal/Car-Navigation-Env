@@ -182,6 +182,16 @@ Two channels clip, and an encoder should know it rather than discover it:
 Everything else uses its full range. There is no reason to normalise the vector
 again; do consider scaling **reward** (below).
 
+### Auxiliary sensors (not in the observation)
+
+`env.radar` is a per-sector (default 8) nearest-*moving*-vehicle range +
+closing-speed sensor, built for the demo HUD's radar readout — not for
+training. It updates every `reset`/`step` but is never concatenated into the
+vector observation, so `vector_dim`/`obs_slices` above are unaffected by it
+regardless of `EnvConfig(radar=..., n_radar_sectors=..., radar_range=...)`.
+Read `env.radar.last_distances` / `.last_closing_speed` / `.sector_bearing(i)`
+directly if you want it in a wrapper's observation.
+
 ### Image
 
 `(image_size, image_size, 3)` `uint8`, third-person chase camera, default 64×64.
@@ -400,6 +410,10 @@ Returned by both `reset` and `step`; a fresh dict each time, safe to keep.
 | `dist_to_target` | `float` | metres to the current waypoint |
 | `target_bearing` | `float` | radians, body frame |
 | `x`, `y`, `heading`, `speed`, `steer_angle` | `float` | privileged ground truth, **for logging and diagnostics only** |
+| `reward_components` | `dict \| absent` | `step`-only; `{"time", "crash", "progress", "target_bonus", "red_light"}`, sums exactly to that step's `reward` -- for logging/dashboards, not present on `reset`'s info |
+
+`reward_components` is purely additive bookkeeping: it does not change the
+`reward` scalar, `observation_space`, or any existing `info` key.
 
 `x`, `y` and `heading` are absolute world state and are deliberately *not* in the
 observation. Feeding them to a policy defeats the whole design — the map is

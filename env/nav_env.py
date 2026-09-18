@@ -19,7 +19,7 @@ import numpy as np
 
 from .world import ProceduralCity, CityConfig
 from .car import Car, CarParams
-from .sensors import Lidar, nav_features, dynamics_features, relative_bearing
+from .sensors import Lidar, Radar, nav_features, dynamics_features, relative_bearing
 from .traffic import Traffic, TRAFFIC_FEATURES
 
 try:                                    # gymnasium is optional
@@ -170,6 +170,11 @@ class EnvConfig:
         traffic_speed=9.0,      # cruise speed, jittered per vehicle
         n_traffic_obs=None,     # None = 4 when traffic is on, else 0
         traffic_obs_range=60.0,
+        # --- radar (auxiliary sensor; never enters the observation vector)
+        radar=True,
+        n_radar_sectors=8,
+        radar_range=60.0,
+        radar_noise=0.0,
     ):
         self.n_targets = n_targets              # waypoints per episode
         self.n_lookahead = n_lookahead          # waypoints exposed in the observation
@@ -205,6 +210,13 @@ class EnvConfig:
         self.traffic_speed = traffic_speed
         self.n_traffic_obs = (4 if traffic else 0) if n_traffic_obs is None else n_traffic_obs
         self.traffic_obs_range = traffic_obs_range
+        # Radar is purely auxiliary (HUD/telemetry), so unlike the lights/traffic
+        # one-switch discipline above it has no observation-block width to keep in
+        # sync -- turning it off just stops the renderer/HUD from reading it.
+        self.radar = radar
+        self.n_radar_sectors = n_radar_sectors
+        self.radar_range = radar_range
+        self.radar_noise = radar_noise
 
 
 class CarNavEnv(_BaseEnv):
@@ -260,6 +272,12 @@ class CarNavEnv(_BaseEnv):
             n_beams=self.cfg.n_beams,
             max_range=self.cfg.lidar_range,
             noise_std=self.cfg.lidar_noise,
+            rng=self.rng,
+        )
+        self.radar = Radar(
+            n_sectors=self.cfg.n_radar_sectors,
+            max_range=self.cfg.radar_range,
+            noise_std=self.cfg.radar_noise,
             rng=self.rng,
         )
 
@@ -361,10 +379,17 @@ class CarNavEnv(_BaseEnv):
         a code change that had nothing to do with it.
         """
         ss = np.random.SeedSequence(seed)
-        env_ss, city_ss, lidar_ss, traffic_ss, space_ss, gym_ss = ss.spawn(6)
+        # `radar_ss` is appended as a 7th, trailing stream rather than inserted
+        # among the existing six: SeedSequence.spawn(N) is a prefix of spawn(M)
+        # for M > N, so adding a stream at the end leaves every existing
+        # subsystem's draws (city, lidar, traffic, ...) exactly as they were --
+        # inserting it earlier would silently reshuffle all of them and break
+        # every previously-seeded rollout's reproducibility.
+        env_ss, city_ss, lidar_ss, traffic_ss, space_ss, gym_ss, radar_ss = ss.spawn(7)
         self.rng = np.random.default_rng(env_ss)
         self.city.rng = np.random.default_rng(city_ss)
         self.lidar.rng = np.random.default_rng(lidar_ss)
+        self.radar.rng = np.random.default_rng(radar_ss)
         self.traffic.rng = np.random.default_rng(traffic_ss)
         space_seed = int(space_ss.generate_state(1, dtype=np.uint32)[0])
         for space in (self.action_space, self.observation_space):
@@ -406,6 +431,8 @@ class CarNavEnv(_BaseEnv):
         # only checks buildings, so a vehicle spawned on the spawn point would put
         # back the unwinnable start that the swept-clearance check removes.
         self.traffic.reset(x, y)
+        if self.cfg.radar:
+            self.radar.scan(self.traffic, self.car)
 
         self.target_idx = 0
         self.step_count = 0
@@ -445,6 +472,11 @@ class CarNavEnv(_BaseEnv):
         steer = action[2]
 
         reward = 0.0
+        comp_time = 0.0
+        comp_crash = 0.0
+        comp_progress = 0.0
+        comp_target = 0.0
+        comp_red_light = 0.0
         terminated = False
         crashed = False
         reached = 0
@@ -458,23 +490,28 @@ class CarNavEnv(_BaseEnv):
             # clean through the car.
             self.traffic.step(cfg.dt, self.car, self.traffic_lights)
             reward -= cfg.time_penalty
+            comp_time -= cfg.time_penalty
 
             hit_building = self.city.collides(
                 self.car.x, self.car.y, self.car.heading,
                 self.car.p.length, self.car.p.width)
             if hit_building or self.traffic.hits(self.car):
                 reward -= cfg.crash_penalty
+                comp_crash -= cfg.crash_penalty
                 terminated = crashed = True
                 self.terminated_reason = "crash"
                 self.crash_with = "building" if hit_building else "vehicle"
                 break
 
             dist = self._dist_to_target()
-            reward += (self.prev_dist - dist) * cfg.progress_weight
+            step_progress = (self.prev_dist - dist) * cfg.progress_weight
+            reward += step_progress
+            comp_progress += step_progress
             self.prev_dist = dist
 
             if dist < cfg.target_radius:
                 reward += cfg.target_bonus
+                comp_target += cfg.target_bonus
                 reached += 1
                 self.target_idx += 1
                 if self.target_idx >= len(self.targets):
@@ -499,6 +536,7 @@ class CarNavEnv(_BaseEnv):
                     axis = self._entry_axis(tl, prev_x, prev_y, half)
                     if tl.state(axis) == 'red':
                         reward -= cfg.red_light_penalty
+                        comp_red_light -= cfg.red_light_penalty
                         self.red_light_violations += 1
                 if in_zone:
                     self._in_intersection.add(i)
@@ -526,7 +564,9 @@ class CarNavEnv(_BaseEnv):
             self.stuck_count = self.stuck_count + 1 if (idle and not held) else 0
             if self.stuck_count >= cfg.stuck_steps:
                 remaining = max(0, cfg.max_episode_steps - self.step_count)
-                reward -= cfg.time_penalty * remaining * cfg.action_repeat
+                stuck_penalty = cfg.time_penalty * remaining * cfg.action_repeat
+                reward -= stuck_penalty
+                comp_time -= stuck_penalty
                 terminated = True
                 self.terminated_reason = "stuck"
 
@@ -534,11 +574,21 @@ class CarNavEnv(_BaseEnv):
         if truncated:
             self.terminated_reason = "timeout"
 
+        if self.cfg.radar:
+            self.radar.scan(self.traffic, self.car)
+
         self.episode_reward += reward
         info = self._info()
         info["crashed"] = crashed
         info["targets_reached_this_step"] = reached
         info["red_light_violations"] = self.red_light_violations
+        info["reward_components"] = {
+            "time": comp_time,
+            "crash": comp_crash,
+            "progress": comp_progress,
+            "target_bonus": comp_target,
+            "red_light": comp_red_light,
+        }
         return self._observe(), float(reward), bool(terminated), bool(truncated), info
 
     # ------------------------------------------------------------------

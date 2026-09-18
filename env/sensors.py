@@ -94,6 +94,88 @@ class Lidar:
                 y + np.sin(angles) * self.last_distances)
 
 
+class Radar:
+    """Ego-centric, per-sector nearest-moving-vehicle range + closing speed.
+
+    Vehicles only -- it never sees building/city geometry, which is LIDAR's
+    job. Sector 0 is centred straight ahead (0 rad in the car's body frame)
+    and sectors run clockwise, matching the convention a HUD radar panel wants
+    ("front" is sector 0), which is why it differs from `Lidar`'s beam 0
+    (centred behind, so the array's wrap-around sits where it carries the
+    least information for a 1D conv).
+
+    This is an auxiliary sensor for display/telemetry: it is never mixed into
+    `CarNavEnv`'s observation vector, so enabling or reconfiguring it cannot
+    change `vector_dim`/`obs_slices` for any existing consumer.
+    """
+
+    def __init__(self, n_sectors=8, max_range=60.0, noise_std=0.0, rng=None):
+        self.n_sectors = n_sectors
+        self.max_range = max_range
+        self.noise_std = noise_std      # metres of Gaussian range noise
+        self.rng = rng or np.random.default_rng()
+        self.last_distances = np.full(n_sectors, max_range, dtype=np.float32)
+        self.last_closing_speed = np.zeros(n_sectors, dtype=np.float32)
+        # Index into the traffic arrays of the tracked vehicle, or -1 if none.
+        self.last_target_idx = np.full(n_sectors, -1, dtype=np.int32)
+
+    @property
+    def forward_index(self):
+        return 0
+
+    def sector_bearing(self, i):
+        """Centre bearing of sector `i`, radians, ego frame (0 = dead ahead)."""
+        return 2.0 * np.pi * i / self.n_sectors
+
+    def scan(self, traffic, car):
+        """Update `last_distances`/`last_closing_speed`/`last_target_idx`.
+
+        Only considers `traffic`'s moving vehicles (`traffic.n_moving`); a
+        stationary parked car has no closing speed to report and radar's
+        whole value here is the relative-velocity read that LIDAR can't give.
+        """
+        n = self.n_sectors
+        self.last_distances = np.full(n, self.max_range, dtype=np.float32)
+        self.last_closing_speed = np.zeros(n, dtype=np.float32)
+        self.last_target_idx = np.full(n, -1, dtype=np.int32)
+
+        m = int(getattr(traffic, "n_moving", 0))
+        if m == 0:
+            return
+
+        dx = traffic.x[:m] - car.x
+        dy = traffic.y[:m] - car.y
+        d = np.hypot(dx, dy)
+        in_range = d <= self.max_range
+        if not np.any(in_range):
+            return
+
+        width = 2.0 * np.pi / n
+        bearing = (np.arctan2(dy, dx) - car.heading + np.pi) % (2.0 * np.pi) - np.pi
+        sector = np.floor((bearing + width / 2.0) / width).astype(int) % n
+
+        # Ego/vehicle world-frame velocities, projected onto the ego->vehicle
+        # unit vector: positive `closing` means the vehicle is approaching,
+        # matching the automotive-radar sign convention.
+        c, s = np.cos(car.heading), np.sin(car.heading)
+        vx = traffic.speed[:m] * np.cos(traffic.heading[:m]) - car.speed * c
+        vy = traffic.speed[:m] * np.sin(traffic.heading[:m]) - car.speed * s
+        safe_d = np.where(d > 1e-6, d, 1.0)
+        ux, uy = dx / safe_d, dy / safe_d
+        closing = -(vx * ux + vy * uy)
+
+        for i in np.where(in_range)[0]:
+            k = int(sector[i])
+            if d[i] < self.last_distances[k]:
+                dist = float(d[i])
+                if self.noise_std > 0.0:
+                    dist = float(np.clip(dist + self.rng.normal(0.0, self.noise_std),
+                                         0.0, self.max_range))
+                self.last_distances[k] = dist
+                self.last_closing_speed[k] = float(closing[i])
+                self.last_target_idx[k] = int(i)
+
+
 def relative_bearing(x, y, heading, tx, ty):
     """Distance and body-frame bearing from a pose to a world point.
 
