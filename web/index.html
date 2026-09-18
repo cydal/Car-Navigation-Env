@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CarNav — live viewer</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+<script type="importmap">{ "imports": { "three": "/vendor/three.module.js" } }</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div class="ui">
+<header class="topbar">
+  <div class="brand"><span class="logo">CarNav</span><span class="word">Live</span><small>Python simulation · Three.js viewer</small></div>
+  <div class="controls">
+    <span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting</span></span>
+    <button id="startBtn" class="primary">Pause</button>
+    <button id="stepBtn" title="Advance one step while paused (.)">Step</button>
+    <button id="restartBtn" title="Restart the same map (R)">Restart</button>
+    <button id="newBtn" title="New random map (N)">New map</button>
+    <label>Traffic <select id="trafficSel"><option value="none">none</option><option value="light">light</option><option value="normal" selected>normal</option><option value="dense">dense</option></select></label>
+    <label>Seed <input id="seedInput" type="number" min="0" max="99999" value="0"></label>
+    <label>Rate <select id="rateSel"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+    <label>View <select id="viewSel"><option value="chase">chase</option><option value="aerial">aerial</option><option value="driver">driver</option></select></label>
+    <label class="check"><input id="overlayChk" type="checkbox" checked> sensors</label>
+    <label class="check"><input id="manualChk" type="checkbox"> manual (arrows)</label>
+    <label class="check"><input id="autoChk" type="checkbox" checked> auto-restart</label>
+  </div>
+</header>
+
+<aside class="feeds">
+  <div class="panel-title">What the car senses</div>
+  <div class="feed" data-cam="front"><div class="feed-view"></div><div class="feed-label"><b>Front camera</b><span>200 m · 70°</span><em>0</em></div></div>
+  <div class="feed" data-cam="left"><div class="feed-view"></div><div class="feed-label"><b>Left camera</b><span>30 m · 120°</span><em>0</em></div></div>
+  <div class="feed" data-cam="right"><div class="feed-view"></div><div class="feed-label"><b>Right camera</b><span>30 m · 120°</span><em>0</em></div></div>
+  <div class="feed" data-cam="rear"><div class="feed-view"></div><div class="feed-label"><b>Rear camera</b><span>70 m · 100°</span><em>0</em></div></div>
+  <div class="sensor-summary">
+    <div class="srow"><b>Radar</b><span id="radarText">—</span></div>
+    <div class="srow"><b>LIDAR</b><span id="lidarText">—</span></div>
+    <div class="srow"><b>Signal</b><span id="signalText">—</span></div>
+  </div>
+</aside>
+
+<aside class="driver">
+  <div class="driver-head"><span class="dot" id="driverDot"></span><b>Driver decides</b><span class="chip" id="modeChip">scripted</span><span id="tickRate">— Hz</span></div>
+  <div class="decision"><div class="label">Intent</div><div class="big" id="intentBig">waiting for the first tick</div><div class="exec" id="execLine"></div></div>
+  <div class="label">Speed caps · km/h</div>
+  <ul class="caps" id="capsList"></ul>
+  <div class="label">Reward</div>
+  <div class="reward"><div><b id="epReward">0.0</b><span>episode</span></div><div><b id="stepReward">+0.00</b><span>this step</span></div></div>
+  <ul class="comps" id="compList"></ul>
+  <div class="stats"><span><b id="statStep">0</b>step</span><span><b id="statWp">0/0</b>waypoints</span><span><b id="statRed">0</b>red lights</span><span><b id="statEp">1</b>episode</span></div>
+</aside>
+
+<section class="dash">
+  <div class="speed"><div class="kmh" id="speedNum">0</div><div class="unit">km/h</div><div class="limit" id="targetRing">—</div><div class="posted" id="postedNote">driver target</div></div>
+  <div class="minimap-wrap"><div class="label">Map</div><canvas id="minimap" width="176" height="176"></canvas></div>
+  <div class="progress">
+    <div class="label">Route</div>
+    <div class="wps" id="wpDots"></div>
+    <div class="track"><i id="stepFill"></i></div>
+    <div class="meta"><span id="clock">0.0 s</span><span id="distText">— m to waypoint</span><span id="runInfo">seed 0 · normal</span></div>
+    <div class="metrics" id="metrics"></div>
+  </div>
+  <div class="timeline-wrap"><div class="label">Last 60 s of decisions</div><div class="timeline" id="timeline"></div>
+    <div class="legend"><i class="m-cruise"></i>cruise <i class="m-traffic"></i>traffic <i class="m-clearance"></i>clearance <i class="m-turn"></i>turn <i class="m-signal"></i>signal <i class="m-manual"></i>manual <i class="m-no_safe_heading"></i>no safe heading</div>
+  </div>
+</section>
+</div>
+
+<pre id="debug" class="debug" hidden></pre>
+<div class="banner" id="banner" hidden></div>
+<div class="modal" id="endCard" hidden>
+  <h2 id="endTitle"></h2>
+  <div class="end-body" id="endBody"></div>
+  <p id="endNote"></p>
+</div>
+<script type="module" src="/app.mjs"></script>
+</body>
+</html>
