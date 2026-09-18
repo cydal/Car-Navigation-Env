@@ -223,8 +223,8 @@ class CarNavEnv(_BaseEnv):
     """Drive a car through a sequence of waypoints in a procedural city.
 
     Action (3,) in [-1, 1]:
-        0  throttle  rescaled to [0, 1]
-        1  brake     rescaled to [0, 1]
+        0  throttle  signed: positive drives forward, negative reverses
+        1  brake     rescaled to [0, 1]; opposes current motion, never itself reverses the car
         2  steer     steering command, scaled to the steering lock
 
     Throttle and brake are separate channels (matching real vehicle interfaces)
@@ -467,7 +467,7 @@ class CarNavEnv(_BaseEnv):
         cfg = self.cfg
         action = np.clip(np.asarray(action, dtype=np.float32).reshape(3), -1.0, 1.0)
         self.last_action = action
-        throttle = (action[0] + 1.0) * 0.5
+        throttle = float(action[0])              # signed: +forward, -reverse
         brake = (action[1] + 1.0) * 0.5
         steer = action[2]
 

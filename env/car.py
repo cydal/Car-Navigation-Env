@@ -29,6 +29,8 @@ class CarParams:
         rolling_resist=0.4,
         drag=0.0035,
         max_speed=22.0,
+        max_reverse_accel=3.0,
+        max_reverse_speed=6.0,
     ):
         self.wheelbase = wheelbase          # front-to-rear axle distance
         self.length = length                # collision footprint
@@ -40,6 +42,8 @@ class CarParams:
         self.rolling_resist = rolling_resist  # constant coast-down decel
         self.drag = drag                    # quadratic air drag coefficient
         self.max_speed = max_speed          # ~80 km/h
+        self.max_reverse_accel = max_reverse_accel  # m/s^2 at full reverse throttle
+        self.max_reverse_speed = max_reverse_speed  # reverse gear is slower than drive
 
 
 class Car:
@@ -62,10 +66,11 @@ class Car:
     def step(self, throttle, brake, steer_cmd, dt):
         """Advance one timestep.
 
-        throttle, brake in [0, 1]; steer_cmd in [-1, 1] scaled to steering lock.
+        throttle in [-1, 1] (negative = reverse gear), brake in [0, 1],
+        steer_cmd in [-1, 1] scaled to steering lock.
         """
         p = self.p
-        throttle = float(np.clip(throttle, 0.0, 1.0))
+        throttle = float(np.clip(throttle, -1.0, 1.0))
         brake = float(np.clip(brake, 0.0, 1.0))
         steer_cmd = float(np.clip(steer_cmd, -1.0, 1.0))
 
@@ -75,13 +80,25 @@ class Car:
         self.steer_angle += np.clip(target - self.steer_angle, -max_delta, max_delta)
 
         # --- longitudinal dynamics
+        # Passive resistance (rolling friction, drag, brake) always opposes whichever
+        # direction the car is currently moving in, and can only coast it to a stop --
+        # never past zero into the opposite direction. Only a throttle command can
+        # change the sign of the velocity, exactly like a real gearbox: braking alone
+        # cannot put a car into reverse. Applying this before the throttle impulse
+        # (rather than netting the two together) is what keeps braking-to-a-halt exact
+        # regardless of how it is combined with a throttle command that opposes motion.
         v0 = self.speed
-        drive = throttle * p.max_accel
-        resist = brake * p.max_brake + p.rolling_resist + p.drag * v0 * v0
-        v = v0 + drive * dt
-        # Braking and friction decelerate but never push the car backwards.
-        v = max(0.0, v - resist * dt)
-        v = min(v, p.max_speed)
+        resist = (brake * p.max_brake + p.rolling_resist + p.drag * v0 * v0) * dt
+        if v0 > 0.0:
+            v1 = max(0.0, v0 - resist)
+        elif v0 < 0.0:
+            v1 = min(0.0, v0 + resist)
+        else:
+            v1 = 0.0
+
+        drive_accel = p.max_accel if throttle >= 0.0 else p.max_reverse_accel
+        v = v1 + throttle * drive_accel * dt
+        v = float(np.clip(v, -p.max_reverse_speed, p.max_speed))
         self.accel = (v - v0) / dt
         self.speed = v
 
