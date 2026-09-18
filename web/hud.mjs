@@ -55,7 +55,7 @@ export const hud = {
     if (d.mode === 'scripted' && typeof d.theta_deg === 'number') {
       const side = d.theta_deg > 2 ? 'right' : d.theta_deg < -2 ? 'left' : 'ahead';
       $('execLine').textContent = `heading ${Math.abs(d.theta_deg).toFixed(0)}° ${side} · target ${Math.round(d.target_speed * 3.6)} km/h · clearance ${fmt(d.chosen_clear, 0)} m (needs ${fmt(d.need, 0)} m)${d.in_corridor ? ' · centring in corridor' : ''}`;
-    } else $('execLine').textContent = m.manual ? `throttle ${fmt((m.action[0] + 1) / 2, 2)} · brake ${fmt((m.action[1] + 1) / 2, 2)} · steer ${fmt(m.action[2], 2)}` : '';
+    } else $('execLine').textContent = m.manual ? `throttle ${fmt(m.action[0], 2)} · steer ${fmt(m.action[2], 2)}` : '';
     for (const li of document.querySelectorAll('#capsList li')) {
       const cap = d.caps ? d.caps[li.dataset.c] : null, ok = cap !== null && cap !== undefined;
       li.querySelector('i').style.width = ok ? `${Math.round(Math.min(1, cap / Math.max(0.1, d.cruise || 1)) * 100)}%` : '0%';
@@ -129,13 +129,19 @@ export const hud = {
     const px = x => x / ex * S, py = y => y / ey * S;
     ctx.imageSmoothingEnabled = false; ctx.clearRect(0, 0, S, S); ctx.drawImage(this.mapBase, 0, 0, S, S);
     world.city.signals.forEach(([x, y], i) => { const l = m.lights[i]; ctx.fillStyle = !l ? '#888' : l.ns === 'green' ? '#3fd08a' : l.ns === 'yellow' ? '#ffd22a' : '#ff4d3d'; ctx.fillRect(px(x) - 2, py(y) - 2, 4, 4); });
-    const v = m.vehicles;
-    for (let i = 0; i < v.x.length; i++) { ctx.fillStyle = i < world.vehicles.n_moving ? '#dfe6ef' : '#6b7a90'; ctx.fillRect(px(v.x[i]) - 1.5, py(v.y[i]) - 1.5, 3, 3); }
     world.targets.slice(m.target_idx).forEach(([x, y], i) => { ctx.fillStyle = i === 0 ? '#3fd08a' : '#ffb020'; ctx.fillRect(px(x) - 3, py(y) - 3, 6, 6); });
+    // Other vehicles are deliberately not drawn here: at this scale their dots and
+    // the ego arrow all read as "a dot on a map", and the one that matters gets
+    // lost in the crowd. A white halo behind the amber arrow keeps it legible
+    // over both the dark road and the lighter building fill.
     const e = m.ego, cx = px(e.x), cy = py(e.y), a = e.heading, s = 6;
-    ctx.fillStyle = '#ffb020'; ctx.beginPath();
-    ctx.moveTo(cx + Math.cos(a) * s, cy + Math.sin(a) * s); ctx.lineTo(cx + Math.cos(a + 2.5) * s * 0.8, cy + Math.sin(a + 2.5) * s * 0.8); ctx.lineTo(cx + Math.cos(a - 2.5) * s * 0.8, cy + Math.sin(a - 2.5) * s * 0.8);
-    ctx.closePath(); ctx.fill();
+    const tip = [cx + Math.cos(a) * s, cy + Math.sin(a) * s];
+    const l1 = [cx + Math.cos(a + 2.5) * s * 0.8, cy + Math.sin(a + 2.5) * s * 0.8];
+    const l2 = [cx + Math.cos(a - 2.5) * s * 0.8, cy + Math.sin(a - 2.5) * s * 0.8];
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(...tip); ctx.lineTo(...l1); ctx.lineTo(...l2); ctx.closePath(); ctx.stroke();
+    ctx.fillStyle = '#ffb020';
+    ctx.beginPath(); ctx.moveTo(...tip); ctx.lineTo(...l1); ctx.lineTo(...l2); ctx.closePath(); ctx.fill();
   },
 
   timelinePush(time, intent) { this.timeline.push({ t: time, m: intent }); if (this.timeline.length > 600) this.timeline.shift(); },

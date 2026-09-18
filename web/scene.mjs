@@ -108,7 +108,7 @@ function fitVehicle(model, length, width) {
   model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = false; } });
   const box = new THREE.Box3().setFromObject(model), size = box.getSize(new THREE.Vector3());
   model.position.set(-(box.min.x + box.max.x) / 2, -box.min.y, -(box.min.z + box.max.z) / 2);
-  const inner = new THREE.Group(); inner.add(model); inner.rotation.y = -Math.PI / 2;
+  const inner = new THREE.Group(); inner.add(model); inner.rotation.y = Math.PI / 2;
   const holder = new THREE.Group(); holder.add(inner);
   holder.scale.set(length / Math.max(size.z, 1e-3), HEIGHT / Math.max(size.y, 1e-3), width / Math.max(size.x, 1e-3));
   return holder;
@@ -343,7 +343,7 @@ export class Scene {
   update(view, world, dt) {
     const e = view.ego, fx = Math.cos(e.heading), fy = Math.sin(e.heading);
     this.ego.position.set(e.x, 0, e.y); this.ego.rotation.y = -e.heading;
-    const braking = (view.action[1] + 1) / 2 > 0.15;
+    const braking = (view.action[1] + 1) / 2 > 0.15 || view.action[0] < -0.05;
     for (const t of this.tail) t.material.emissiveIntensity = braking ? 3.2 : 0.8;
 
     const v = view.vehicles;
