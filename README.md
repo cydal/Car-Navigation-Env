@@ -166,9 +166,11 @@ measured; only one of them is cheap.
 
 ## Action
 
-`Box(-1, 1, (3,))` → throttle, brake, steer. Throttle and brake are rescaled to
-[0, 1]; steer is a *command*, not an angle, and passes through the rate limiter.
-Braking cannot reverse the car.
+`Box(-1, 1, (3,))` → throttle, brake, steer. Throttle is signed and passed
+through unchanged (positive drives forward, negative reverses); brake is
+rescaled to [0, 1] and only ever decelerates whichever direction the car is
+already moving in — braking alone can't reverse it, only negative throttle
+can. Steer is a *command*, not an angle, and passes through the rate limiter.
 
 ## Reward
 

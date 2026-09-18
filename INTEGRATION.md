@@ -141,7 +141,7 @@ With the defaults (`n_beams=32`, `n_lookahead=3`, `n_tl_obs=1`, `n_traffic_obs=4
 | block | slice | dims | contents |
 |---|---|---|---|
 | `lidar` | `0:32` | 32 | 360° ranges / 60 m. Index `n_beams // 2` (= 16) is straight ahead; index 0 is straight back, so the array's wrap-around discontinuity sits at the rear. `1.0` = nothing in range. Vehicles are in this scan as geometry. |
-| `dynamics` | `32:37` | 5 | speed / 22, yaw rate / 2, steer angle / lock, accel / max_brake, slip / lock |
+| `dynamics` | `32:37` | 5 | speed / 22 (slightly negative in reverse, down to -0.27), yaw rate / 2, steer angle / lock, accel / max_brake, slip / lock |
 | `nav` | `37:46` | 9 | next 3 waypoints × (distance / 150 m clipped to 1, sin, cos of bearing) |
 | `traffic_light` | `46:53` | 7 | nearest signal: distance **to the stop line** / 60 m, sin, cos of bearing, then one-hot red / yellow / green **for this car's approach axis**, then steps until the phase changes / 100 |
 | `traffic` | `53:73` | 20 | nearest 4 **moving** vehicles × (distance / 60 m, sin, cos of bearing, relative velocity x and y in the ego frame / 22) |
@@ -205,16 +205,21 @@ See [Image observations](#image-observations).
 
 | index | channel | mapping |
 |---|---|---|
-| 0 | throttle | rescaled to [0, 1] |
+| 0 | throttle | **signed**: passed straight through. Positive drives forward, negative reverses. |
 | 1 | brake | rescaled to [0, 1] |
 | 2 | steer | a **command**, not an angle; passes through a rate limiter |
 
-`-1` therefore means "no throttle" and "no brake", so the zero action
-`[0, 0, 0]` is half throttle and half brake, not coasting. Coasting is
-`[-1, -1, 0]`.
+`-1` therefore means "full reverse" for throttle, but "no brake" for brake, so
+the zero action `[0, 0, 0]` is coasting (no drive, no brake) -- unlike brake,
+throttle needed no rescale since it was already the signed quantity the car
+wants.
 
-Out-of-range actions are clipped, not rejected. A wrong **shape** raises. Braking
-cannot reverse the car; there is no reverse gear.
+Out-of-range actions are clipped, not rejected. A wrong **shape** raises.
+Braking alone can never reverse the car -- it only ever decelerates whichever
+direction the car is already moving in, and stops exactly at zero. Only a
+negative throttle command drives it backward, up to `max_reverse_speed`
+(6 m/s by default, slower than the forward top speed) at `max_reverse_accel`
+(3 m/s², gentler than the forward 4.5 m/s²).
 
 Steer is rate limited at 150°/s toward a 32° lock, and the resulting angle is
 hidden state — which is why it is in the observation. Do not assume the commanded
@@ -517,8 +522,10 @@ for a latent dynamics model:
 
 ## Things that will bite you
 
-1. **The zero action is not coasting.** `[0, 0, 0]` is half throttle *and* half
-   brake. Coasting is `[-1, -1, 0]`.
+1. **The zero action *is* coasting** -- zero throttle, zero brake. (This
+   flipped when throttle became signed: it used to be half throttle and half
+   brake, with `[-1, -1, 0]` for coasting; check any code written against the
+   old convention.)
 2. **`stuck` is `terminated`, not `truncated`,** and its lump-sum penalty is only
    return-neutral undiscounted. Set `stuck_steps=0` if that shaping is in your way.
 3. **Do not wrap in `TimeLimit`.** The env has its own limit and reports it as
