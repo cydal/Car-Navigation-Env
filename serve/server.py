@@ -107,9 +107,11 @@ class Session:
         self.restart_at = None
 
     def manual_action(self):
+        # Signed throttle: up drives forward, down reverses -- no separate manual
+        # brake key, same convention as main.py's --keys demo.
         k = self.keys
-        return np.array([1.0 if k["up"] else -1.0,
-                         1.0 if k["down"] else -1.0,
+        thr = (1.0 if k["up"] else 0.0) - (1.0 if k["down"] else 0.0)
+        return np.array([thr, -1.0,
                          (1.0 if k["right"] else 0.0) - (1.0 if k["left"] else 0.0)],
                         dtype=np.float32)
 

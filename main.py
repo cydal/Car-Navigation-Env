@@ -59,7 +59,7 @@ def cmd_spec(args):
     print(f"           {env.vector_dim:>3} {'total':<14} "
           f"ego-centric only -- no absolute position or heading")
     print()
-    print("ACTION  Box(-1, 1, (3,))   throttle, brake, steer  (throttle/brake rescaled to [0,1])")
+    print("ACTION  Box(-1, 1, (3,))   throttle (signed, +fwd/-rev), brake ([0,1]), steer")
     print()
     print("CAR     kinematic bicycle model")
     print(f"  wheelbase {p.wheelbase} m, body {p.length} x {p.width} m")
@@ -173,11 +173,13 @@ def cmd_demo(args):
     base.accept("m", lambda: state.__setitem__("manual", not state["manual"]))
 
     def manual_action():
-        thr = 1.0 if keys.get("arrow_up") else -1.0
-        brk = 1.0 if keys.get("arrow_down") else -1.0
+        # Signed throttle: up drives forward, down reverses (there is no separate
+        # manual brake key -- releasing throttle already coasts the car down, and
+        # holding down past zero speed backs it up, same as a simple RC car).
+        thr = (1.0 if keys.get("arrow_up") else 0.0) - (1.0 if keys.get("arrow_down") else 0.0)
         steer = (1.0 if keys.get("arrow_right") else 0.0) - \
                 (1.0 if keys.get("arrow_left") else 0.0)
-        return np.array([thr, brk, steer], dtype=np.float32)
+        return np.array([thr, -1.0, steer], dtype=np.float32)
 
     def update(task):
         if not state["paused"]:
