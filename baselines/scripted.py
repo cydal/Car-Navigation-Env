@@ -366,5 +366,6 @@ class GapFollower:
             "v_traffic": v_traffic,
         }
 
-        # Env expects every channel in [-1, 1]; throttle/brake are rescaled to [0, 1].
-        return np.array([throttle * 2.0 - 1.0, brake * 2.0 - 1.0, steer], dtype=np.float32)
+        # `throttle` here is already the signed [-1, 1] channel the env expects (this
+        # driver never reverses, so it stays in [0, 1]); `brake` is rescaled to [0, 1].
+        return np.array([throttle, brake * 2.0 - 1.0, steer], dtype=np.float32)

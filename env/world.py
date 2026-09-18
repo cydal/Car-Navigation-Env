@@ -118,6 +118,10 @@ class ProceduralCity:
         """
         self.grid = grid
         self.road_cells = cells
+        # Corridor start indices, kept so a renderer can draw centre lines and
+        # edge markings per corridor without re-deriving the layout from tiles.
+        self.v_roads = [int(v) for v in v_roads]
+        self.h_roads = [int(h) for h in h_roads]
         self.intersections = self._find_intersections(grid, v_roads, h_roads)
         self.signals = self._choose_signals(self.intersections)
         self.road_nodes, self.node_links = self._build_road_graph(grid, v_roads, h_roads)

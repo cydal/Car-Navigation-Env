@@ -15,11 +15,14 @@ dependencies = ["numpy>=1.22"]
 [project.optional-dependencies]
 gym = ["gymnasium>=0.29"]          # gym.make ids, wrappers, vector envs
 render = ["panda3d>=1.10", "pillow>=9"]   # image observations, demo window, shots
-dev = ["gymnasium>=0.29", "panda3d>=1.10", "pillow>=9"]
+viewer = ["websockets>=13"]        # `main.py serve`: live browser viewer, no graphics stack
+dev = ["gymnasium>=0.29", "panda3d>=1.10", "pillow>=9", "websockets>=13"]
 
 [tool.setuptools]
 # Flat top-level packages, as the repo is laid out. `env` is a generic name, so
 # prefer a dedicated virtualenv for an editable install; INTEGRATION.md documents
-# a PYTHONPATH alternative that installs nothing.
-packages = ["env", "render", "baselines", "tasks"]
+# a PYTHONPATH alternative that installs nothing. The viewer's static files in
+# web/ and the car models are located relative to the source tree, so the viewer
+# needs a checkout (editable install or PYTHONPATH), not a wheel.
+packages = ["env", "render", "baselines", "tasks", "serve"]
 py-modules = ["carnav", "main"]

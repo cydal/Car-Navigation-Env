@@ -6,6 +6,7 @@ Entry point for the 3D car navigation environment.
     python main.py demo --keys   # drive it yourself with the arrow keys
     python main.py shots         # save a grid of agent-view frames to a PNG
     python main.py bench         # throughput, vector vs image
+    python main.py serve         # live browser viewer at http://localhost:8765
 
 `demo` is the one to reach for when something looks wrong: seeing the LIDAR fan
 against the geometry it is measuring explains observation bugs far faster than
@@ -200,11 +201,25 @@ def cmd_demo(args):
     base.run()
 
 
+def cmd_serve(args):
+    from serve.server import main as serve_main
+    serve_main(host=args.host, port=args.port, seed=args.seed, map_size=args.map,
+               n_targets=args.targets, traffic=args.traffic, manual=args.keys,
+               rate=args.rate)
+
+
 # ----------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["spec", "demo", "shots", "bench"])
+    ap.add_argument("cmd", choices=["spec", "demo", "shots", "bench", "serve"])
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="serve: bind address; 0.0.0.0 to reach it from another machine")
+    ap.add_argument("--port", type=int, default=8765, help="serve: port")
+    ap.add_argument("--traffic", default="normal", choices=["none", "light", "normal", "dense"],
+                    help="serve: traffic preset")
+    ap.add_argument("--rate", type=float, default=1.0,
+                    help="serve: simulation speed relative to real time")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--map", type=int, default=48, help="city size in tiles")
     ap.add_argument("--targets", type=int, default=3)
