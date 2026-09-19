@@ -14,7 +14,7 @@ const fmt = (v, d = 0) => (v === null || v === undefined || !Number.isFinite(v))
 const COMPASS = ['front', 'front-right', 'right', 'rear-right', 'rear', 'rear-left', 'left', 'front-left'];
 const compass = rad => COMPASS[((Math.round(rad / (Math.PI / 4)) % 8) + 8) % 8];
 const INTENT = { cruise: 'Cruise', traffic: 'Follow the traffic', clearance: 'Hold back for clearance', turn: 'Ease off while steering', signal: 'Stop for the signal', manual: 'Manual drive', no_safe_heading: 'No safe heading', starting: 'Starting' };
-const COMPS = { progress: 'progress', time: 'time', target_bonus: 'waypoint', red_light: 'red light', crash: 'crash' };
+const COMPS = { progress: 'progress', time: 'time', target_bonus: 'waypoint', red_light: 'red light', speeding: 'speeding', pedestrian: 'pedestrian', crash: 'crash' };
 const ENDINGS = { success: ['Route complete', 'good'], crash: ['Crashed', 'bad'], stuck: ['Stuck', 'bad'], timeout: ['Out of time', 'bad'] };
 
 export const hud = {
@@ -53,10 +53,19 @@ export const hud = {
     const hasTarget = !m.manual && d.target_speed !== undefined;
     $('speedNum').textContent = Math.round(kmh);
     const ring = $('targetRing');
-    ring.textContent = hasTarget ? Math.round(d.target_speed * 3.6) : '—';
-    ring.classList.toggle('over', cruiseSpeed != null && kmh > cruiseSpeed * 3.6 + 2);
-    $('postedNote').textContent = m.manual ? 'manual · arrows drive'
-      : hasTarget ? `driver target · cruise ${Math.round(cruiseSpeed * 3.6)}` : `${d.kind || 'agent'} driving`;
+    if (m.speed_limit_kmh != null) {
+      // With signs on, the ring is the posted limit (a real road sign) and the
+      // driver's own target moves down into the note.
+      ring.textContent = m.speed_limit_kmh;
+      ring.classList.toggle('over', kmh > m.speed_limit_kmh + 2);
+      const next = m.next_sign ? ` · ${m.next_sign.limit_kmh} in ${Math.round(m.next_sign.dist)} m` : '';
+      $('postedNote').textContent = (m.manual ? 'posted limit' : hasTarget ? `posted · target ${Math.round(d.target_speed * 3.6)}` : `posted · ${d.kind || 'agent'}`) + next;
+    } else {
+      ring.textContent = hasTarget ? Math.round(d.target_speed * 3.6) : '—';
+      ring.classList.toggle('over', cruiseSpeed != null && kmh > cruiseSpeed * 3.6 + 2);
+      $('postedNote').textContent = m.manual ? 'manual · arrows drive'
+        : hasTarget ? `driver target · cruise ${Math.round(cruiseSpeed * 3.6)}` : `${d.kind || 'agent'} driving`;
+    }
 
     // Reward.
     $('epReward').textContent = fmt(info.episode_reward, 1);
@@ -97,7 +106,8 @@ export const hud = {
     $('stepFill').style.width = `${Math.min(100, m.step / world.cfg.max_steps * 100)}%`;
     $('clock').textContent = `${fmt(m.time, 1)} s`;
     $('distText').textContent = `${fmt(info.dist_to_target, 1)} m to waypoint`;
-    $('metrics').innerHTML = [['moving', world.vehicles.n_moving], ['parked', kinds.length - world.vehicles.n_moving], ['min lidar', `${dmin.toFixed(1)} m`], ['steer', `${(e.steer * 180 / Math.PI).toFixed(0)}°`], ['accel', `${fmt(e.accel, 1)} m/s²`]]
+    const peopleRow = world.street && world.street.pedestrians ? [['on zebra', `${info.pedestrians_on_road ?? 0}/${world.street.n_pedestrians}`]] : [];
+    $('metrics').innerHTML = [['moving', world.vehicles.n_moving], ['parked', kinds.length - world.vehicles.n_moving], ...peopleRow, ['min lidar', `${dmin.toFixed(1)} m`], ['steer', `${(e.steer * 180 / Math.PI).toFixed(0)}°`], ['accel', `${fmt(e.accel, 1)} m/s²`]]
       .map(([k, v]) => `<span><b>${v}</b>${k}</span>`).join('');
     this.drawMap(m, world);
     this.timelineRender(m.time);
@@ -131,6 +141,11 @@ export const hud = {
     const px = x => x / ex * S, py = y => y / ey * S;
     ctx.imageSmoothingEnabled = false; ctx.clearRect(0, 0, S, S); ctx.drawImage(this.mapBase, 0, 0, S, S);
     world.city.signals.forEach(([x, y], i) => { const l = m.lights[i]; ctx.fillStyle = !l ? '#888' : l.ns === 'green' ? '#3fd08a' : l.ns === 'yellow' ? '#ffd22a' : '#ff4d3d'; ctx.fillRect(px(x) - 2, py(y) - 2, 4, 4); });
+    // Zebra crossings: a short white tick across the corridor.
+    if (world.street) for (const c of world.street.crossings) {
+      ctx.strokeStyle = '#f2f2ee'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(px(c.x - c.perp[0] * 5), py(c.y - c.perp[1] * 5)); ctx.lineTo(px(c.x + c.perp[0] * 5), py(c.y + c.perp[1] * 5)); ctx.stroke();
+    }
     world.targets.slice(m.target_idx).forEach(([x, y], i) => { ctx.fillStyle = i === 0 ? '#3fd08a' : '#ffb020'; ctx.fillRect(px(x) - 3, py(y) - 3, 6, 6); });
     // Other vehicles are deliberately not drawn here: at this scale their dots and
     // the ego arrow all read as "a dot on a map", and the one that matters gets

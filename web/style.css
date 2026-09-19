@@ -103,6 +103,7 @@ input[type=number] { width: 70px; }
 .m-cruise { background: var(--green); } .m-traffic { background: var(--teal); } .m-clearance { background: #8fd3d0; }
 .m-turn { background: var(--amber); } .m-signal { background: var(--red); } .m-manual { background: var(--violet); }
 .m-no_safe_heading { background: #b3001b; } .m-starting { background: #5b6675; }
+.m-pedestrian { background: #ff6b9d; } .m-limit { background: #7fd8ff; }
 
 .banner { position: fixed; top: 84px; left: 50%; transform: translateX(-50%); padding: 10px 16px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); z-index: 8; font-size: 14px; max-width: 60vw; text-align: center; backdrop-filter: blur(10px); }
 .banner.error { border-color: var(--red); color: #ffb3ac; }

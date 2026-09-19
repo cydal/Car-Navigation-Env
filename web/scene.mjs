@@ -151,6 +151,26 @@ function fitVehicle(model, length, width) {
   holder.scale.set(length / Math.max(size.z, 1e-3), HEIGHT / Math.max(size.y, 1e-3), width / Math.max(size.x, 1e-3));
   return holder;
 }
+const PEOPLE_COLORS = [0xd9534f, 0x3d7dd9, 0x3fb27f, 0xf0a030, 0x8f5fd1, 0x2b2f36];
+const _signTex = new Map();
+function signTexture(limit) {
+  if (_signTex.has(limit)) return _signTex.get(limit);
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffff'; g.beginPath(); g.arc(128, 128, 124, 0, Math.PI * 2); g.fill();
+  g.lineWidth = 26; g.strokeStyle = '#d0342c'; g.beginPath(); g.arc(128, 128, 108, 0, Math.PI * 2); g.stroke();
+  g.fillStyle = '#111'; g.font = 'bold 118px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(String(limit), 128, 136);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; _signTex.set(limit, t); return t;
+}
+// A walking figure: legs, torso, head. Authored facing local +x like every vehicle mesh.
+function makePerson(color) {
+  const g = new THREE.Group();
+  const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.19, 0.8, 10), new THREE.MeshStandardMaterial({ color: 0x2c3e50 })); legs.position.y = 0.4; g.add(legs);
+  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 0.45, 4, 10), new THREE.MeshStandardMaterial({ color })); torso.position.y = 1.08; torso.castShadow = true; g.add(torso);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.14, 12, 10), new THREE.MeshStandardMaterial({ color: 0xe0b89a, roughness: 0.8 })); head.position.y = 1.6; g.add(head);
+  return g;
+}
+
 function fallbackVehicle(length, width, color = 0x8a919b) {
   const g = new THREE.Group();
   const m = new THREE.Mesh(new THREE.BoxGeometry(length, HEIGHT, width), new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.3 }));
@@ -219,6 +239,7 @@ export class Scene {
     this.buildSignals(m.city);
     this.buildMarkers(m);
     this.buildVehicles(m);
+    this.buildStreet(m);
     this.buildEgo(m);
     this.buildLidar(m);
     if (m.cameras) {
@@ -497,6 +518,53 @@ export class Scene {
     });
   }
 
+  // Zebra stripes, numbered sign posts and one walking figure per pedestrian, from
+  // the reset message's `street` block. All of it is optional: with both flags off
+  // the block is empty and nothing here is built.
+  buildStreet(m) {
+    if (this.pedGroup) { disposeGroup(this.pedGroup); this.scene.remove(this.pedGroup); }
+    this.pedGroup = new THREE.Group(); this.scene.add(this.pedGroup); this.peds = [];
+    const st = m.street; if (!st) return;
+    const g = this.worldGroup, half = st.half;
+    const white = new THREE.MeshBasicMaterial({ color: C.white });
+    const stripes = [];
+    for (const c of st.crossings) {
+      // Bars run along the corridor (3 m) and repeat across it every 1.2 m.
+      const rot = -Math.atan2(c.along[1], c.along[0]);
+      for (let k = -half + 1.1; k <= half - 1.1; k += 1.2) stripes.push({ pos: V(c.x + c.perp[0] * k, c.y + c.perp[1] * k, 0.013), rotY: rot });
+    }
+    if (stripes.length) g.add(instanced(flatGeom(3.0, 0.55), white, stripes));
+    if (st.signs.length) {
+      const poleGeo = new THREE.CylinderGeometry(0.05, 0.05, 2.3, 8), discGeo = new THREE.CircleGeometry(0.42, 32);
+      const poleMat = new THREE.MeshStandardMaterial({ color: 0x777c84 }), backMat = new THREE.MeshStandardMaterial({ color: 0x8a8f96 });
+      for (const s of st.signs) {
+        const pole = new THREE.Mesh(poleGeo, poleMat); pole.position.set(s.x, 1.15, s.y); g.add(pole);
+        const disc = new THREE.Mesh(discGeo, new THREE.MeshBasicMaterial({ map: signTexture(s.limit_kmh) }));
+        // The face looks back at the traffic it addresses, i.e. along -face.
+        disc.position.set(s.x - s.face[0] * 0.04, 2.55, s.y - s.face[1] * 0.04);
+        disc.rotation.y = Math.atan2(-s.face[0], -s.face[1]);
+        g.add(disc);
+        const back = new THREE.Mesh(discGeo, backMat); back.position.set(s.x + s.face[0] * 0.04, 2.55, s.y + s.face[1] * 0.04);
+        back.rotation.y = Math.atan2(s.face[0], s.face[1]); g.add(back);
+      }
+    }
+    for (let i = 0; i < st.n_pedestrians; i++) {
+      const fig = makePerson(PEOPLE_COLORS[i % PEOPLE_COLORS.length]);
+      this.pedGroup.add(fig); this.peds.push(fig);
+    }
+  }
+
+  updatePedestrians(view) {
+    const p = view.pedestrians; if (!p || !this.peds.length) return;
+    for (let i = 0; i < this.peds.length && i < p.x.length; i++) {
+      const fig = this.peds[i];
+      fig.position.set(p.x[i], 0, p.y[i]);
+      fig.rotation.y = -p.heading[i];
+      const walking = p.state[i] === 1;
+      fig.position.y = walking ? Math.abs(Math.sin(performance.now() / 140 + i)) * 0.05 : 0;   // a light step bob
+    }
+  }
+
   buildEgo(m) {
     if (this.egoBuilt) return;
     this.egoBuilt = true;
@@ -529,6 +597,7 @@ export class Scene {
 
     const v = view.vehicles;
     for (let i = 0; i < this.vehicles.length && i < v.x.length; i++) { const g = this.vehicles[i].g; g.position.set(v.x[i], 0, v.y[i]); g.rotation.y = -v.heading[i]; }
+    this.updatePedestrians(view);
 
     view.lights.forEach((l, i) => {
       const L = this.lamps[i]; if (!L) return;

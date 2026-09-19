@@ -219,6 +219,9 @@ class PandaRenderer:
         # Reloading a .glb for each of ~26 vehicles on every reset would cost more
         # than the whole city mesh does.
         self._veh_protos = {}         # kind index -> prototype NodePath (detached)
+        self._street_np = None        # zebra stripes + sign posts, one mesh per episode
+        self._ped_root = None         # one box figure per pedestrian
+        self._ped_nps = []
         self._veh_root = None         # NodePath holding one instance per vehicle
         self._veh_nps = []
         self._setup_lights()
@@ -793,6 +796,70 @@ class PandaRenderer:
             np_.setH(-np.degrees(float(traffic.heading[i])))
 
     # ------------------------------------------------------------------
+    # Zebra crossings, speed signs, pedestrians (env/crossings.py)
+    # ------------------------------------------------------------------
+    # Signs carry no text here (no font/texture pipeline in this renderer), so
+    # the two limits are told apart by colour: 30 is an amber-red disc, 50 white.
+    _SIGN_COL = {30: (0.92, 0.36, 0.28, 1), 50: (0.96, 0.96, 0.94, 1)}
+    _PED_COLS = ((0.85, 0.33, 0.31, 1), (0.24, 0.49, 0.85, 1), (0.25, 0.70, 0.50, 1),
+                 (0.94, 0.63, 0.19, 1), (0.56, 0.37, 0.82, 1), (0.17, 0.18, 0.21, 1))
+
+    def _setup_street(self, street):
+        """One static mesh for stripes and posts, one small node per person."""
+        if self._street_np is not None:
+            self._street_np.removeNode()
+            self._street_np = None
+        if self._ped_root is not None:
+            self._ped_root.removeNode()
+            self._ped_root = None
+        self._ped_nps = []
+        if street is None or street.n_crossings == 0:
+            return
+        from env.traffic import DIRS, _right
+        WHITE, POLE = (0.95, 0.95, 0.93, 1), (0.47, 0.49, 0.52, 1)
+        parts = []
+        half = street.half
+        for i in range(street.n_crossings):
+            a, p = DIRS[street.cdir[i]], DIRS[_right(street.cdir[i])]
+            cx, cy = float(street.cx[i]), float(street.cy[i])
+            for k in np.arange(-half + 1.1, half - 1.0, 1.2):
+                # Stripe: 3 m along the corridor, 0.55 m across, in Panda (x, -y).
+                ex, ey = 1.5 * abs(a[0]) + 0.275 * abs(p[0]), 1.5 * abs(a[1]) + 0.275 * abs(p[1])
+                sx, sy = cx + p[0] * k, -(cy + p[1] * k)
+                parts.append(_box_mesh((sx - ex, sy - ey, 0.0), (sx + ex, sy + ey, 0.02), WHITE))
+        for x, y, lim, fx, fy in street.signs:
+            px, py = float(x), -float(y)
+            parts.append(_box_mesh((px - 0.05, py - 0.05, 0.0), (px + 0.05, py + 0.05, 2.3), POLE))
+            col = self._SIGN_COL.get(int(round(lim * 3.6)), WHITE)
+            # Disc is a thin box facing the traffic it addresses (perpendicular to `face`).
+            tx, ty = (0.03, 0.42) if abs(fx) > 0.5 else (0.42, 0.03)
+            parts.append(_box_mesh((px - tx, py - ty, 2.13), (px + tx, py + ty, 2.97), col))
+        self._street_np = _mesh_to_node("street", np.concatenate(parts))
+        self._street_np.reparentTo(self.base.render)
+
+        if street.n_pedestrians:
+            self._ped_root = self.base.render.attachNewNode("pedestrians")
+            for j in range(street.n_pedestrians):
+                col = self._PED_COLS[j % len(self._PED_COLS)]
+                body = np.concatenate([
+                    _box_mesh((-0.18, -0.18, 0.0), (0.18, 0.18, 0.85), (0.17, 0.24, 0.31, 1)),  # legs
+                    _box_mesh((-0.22, -0.22, 0.85), (0.22, 0.22, 1.45), col),                    # torso
+                    _box_mesh((-0.13, -0.13, 1.45), (0.13, 0.13, 1.72), (0.88, 0.72, 0.60, 1)),  # head
+                ])
+                np_ = _mesh_to_node(f"ped{j}", body)
+                np_.reparentTo(self._ped_root)
+                self._ped_nps.append(np_)
+
+    def _update_pedestrians(self, env):
+        street = getattr(env, "street", None)
+        if street is None or not self._ped_nps:
+            return
+        for j, np_ in enumerate(self._ped_nps):
+            if j >= street.n_pedestrians:
+                break
+            np_.setPos(float(street.px[j]), -float(street.py[j]), 0.0)   # Y-mirrored
+
+    # ------------------------------------------------------------------
     def build_scene(self, city, traffic=None, street=None):
         """(Re)build the city mesh. Called on every reset, so it must be quick."""
         if self._city_np is not None:
@@ -911,7 +978,7 @@ class PandaRenderer:
 
         self._setup_traffic_lights(city)
         self._setup_traffic(traffic)
-        self._street = street
+        self._setup_street(street)
 
         if self.show_minimap and self._mm_city_tex is not None:
             self._build_minimap_texture(city)
@@ -1000,12 +1067,13 @@ class PandaRenderer:
         own render loop instead of us calling renderFrame by hand.
         """
         if self._city_np is None:
-            self.build_scene(env.city, getattr(env, "traffic", None))
+            self.build_scene(env.city, getattr(env, "traffic", None), getattr(env, "street", None))
         self._place_camera(env)
         self._place_actors(env)
         self._draw_rays(env)
         self._update_traffic_lights(env)
         self._update_traffic(env)
+        self._update_pedestrians(env)
         if self.show_minimap:
             self._update_minimap(env)
         if self.show_cameras:
@@ -1051,6 +1119,13 @@ class PandaRenderer:
             self._veh_root.removeNode()
             self._veh_root = None
         self._veh_nps = []
+        if self._street_np is not None:
+            self._street_np.removeNode()
+            self._street_np = None
+        if self._ped_root is not None:
+            self._ped_root.removeNode()
+            self._ped_root = None
+        self._ped_nps = []
         if self._mm_np is not None:
             self._mm_np.removeNode()
             self._mm_np = None

@@ -93,10 +93,12 @@ class Session:
     """One env + driver, stepped in real time, serialised for the browser."""
 
     def __init__(self, seed=0, map_size=48, n_targets=3, traffic="normal", world="city",
-                 agent="scripted", manual=False, rate=1.0):
+                 agent="scripted", manual=False, rate=1.0, pedestrians=False, speed_signs=False):
         self.map_size = map_size
         self.n_targets = n_targets
         self.agent_spec = agent
+        self.pedestrians = bool(pedestrians)
+        self.speed_signs = bool(speed_signs)
         self.manual = manual
         self.rate = rate
         self.paused = False
@@ -115,7 +117,8 @@ class Session:
         self.theme = theme
         n_moving, n_parked = TRAFFIC_PRESETS[traffic]
         self.traffic_preset = traffic
-        cfg = EnvConfig(n_targets=self.n_targets, n_traffic=n_moving, n_parked=n_parked)
+        cfg = EnvConfig(n_targets=self.n_targets, n_traffic=n_moving, n_parked=n_parked,
+                        pedestrians=self.pedestrians, speed_signs=self.speed_signs)
         city_kwargs = dict(width=self.map_size, height=self.map_size)
         city_kwargs.update(city_overrides)
         city = CityConfig(**city_kwargs)
@@ -179,6 +182,7 @@ class Session:
                 "signals": _arr(np.asarray(city.signals, dtype=float).reshape(-1, 2)),
             },
             "targets": _arr(env.targets), "target_radius": env.cfg.target_radius,
+            "street": self._street_message(),
             "vehicles": {
                 "kind": [VEHICLE_KINDS[int(k)][0] for k in t.kind],
                 "length": _arr(t.length, 2), "width": _arr(t.width, 2),
@@ -200,9 +204,36 @@ class Session:
                        for name, (fwd, right, yaw, fov, rng) in CAMERAS.items()},
         }
 
+    def _street_message(self):
+        """Static per-episode street furniture: crossings, signs, and which flags are on."""
+        from env.traffic import DIRS, _right
+        st, cfg = self.env.street, self.env.cfg
+        crossings = []
+        for i in range(st.n_crossings):
+            a, p = DIRS[st.cdir[i]], DIRS[_right(st.cdir[i])]
+            crossings.append({"x": round(float(st.cx[i]), 2), "y": round(float(st.cy[i]), 2),
+                              "along": [float(a[0]), float(a[1])], "perp": [float(p[0]), float(p[1])],
+                              "zone_f": round(float(st.zone_f[i]), 1), "zone_b": round(float(st.zone_b[i]), 1)})
+        signs = [{"x": round(float(x), 2), "y": round(float(y), 2), "limit_kmh": int(round(lim * 3.6)),
+                  "face": [float(fx), float(fy)]} for x, y, lim, fx, fy in st.signs]
+        return {"pedestrians": self.pedestrians, "speed_signs": self.speed_signs,
+                "half": float(st.half), "crossings": crossings, "signs": signs,
+                "n_pedestrians": int(st.n_pedestrians),
+                "limit_kmh": cfg.speed_limit_kmh, "zone_limit_kmh": cfg.zone_limit_kmh}
+
     def tick_message(self):
         env, car, t = self.env, self.env.car, self.env.traffic
         info = self.info
+        st = env.street
+        if st.n_pedestrians:
+            from env.traffic import DIRS, _right
+            p = DIRS[_right(st.cdir[st.pc])]
+            face = np.arctan2(-st.side * p[:, 1], -st.side * p[:, 0])   # toward the far kerb
+            peds = {"x": _arr(st.px), "y": _arr(st.py), "heading": _arr(face),
+                    "state": st.state.tolist()}
+        else:
+            peds = {"x": [], "y": [], "heading": [], "state": []}
+        nxt = st.next_sign(car, env.cfg.sign_range) if env.cfg.speed_signs else None
         restart_in = None
         if self.done and self.restart_at is not None:
             restart_in = round(max(0.0, self.restart_at - time.monotonic()), 2)
@@ -217,6 +248,9 @@ class Session:
                          "heading": _arr(t.heading), "speed": _arr(t.speed, 2)},
             "lights": [{"ns": tl.ns_state, "ew": tl.ew_state, "left": int(tl.steps_remaining)}
                        for tl in env.traffic_lights],
+            "pedestrians": peds,
+            "speed_limit_kmh": (round(st.limit_at(car.x, car.y) * 3.6) if env.cfg.speed_signs else None),
+            "next_sign": ({"dist": round(nxt[0], 1), "limit_kmh": int(round(nxt[1] * 3.6))} if nxt else None),
             "target_idx": int(env.target_idx),
             "lidar": _arr(env.lidar.last_distances, 2),
             "radar": {"dist": _arr(env.radar.last_distances, 1),
@@ -289,6 +323,13 @@ class Server:
             if world in WORLD_PRESETS:
                 s.build(s.seed, s.traffic_preset, world=world)
                 self.send_all(s.reset_message())
+        elif kind == "street":
+            # Pedestrians / speed signs change the observation layout, so this
+            # rebuilds the env (and the agent) the same way a traffic preset does.
+            s.pedestrians = bool(cmd.get("pedestrians", s.pedestrians))
+            s.speed_signs = bool(cmd.get("signs", s.speed_signs))
+            s.build(s.seed, s.traffic_preset)
+            self.send_all(s.reset_message())
         elif kind == "mode":
             s.manual = bool(cmd.get("manual"))
             s.manual_agent.reset()

@@ -26,7 +26,8 @@ from agents import load_agent
 
 def build_env(args, obs_type, renderer=None, image_size=64):
     city = CityConfig(width=args.map, height=args.map)
-    cfg = EnvConfig(n_targets=args.targets, n_beams=args.beams)
+    cfg = EnvConfig(n_targets=args.targets, n_beams=args.beams,
+                    pedestrians=args.pedestrians, speed_signs=args.signs)
     return CarNavEnv(config=cfg, city_config=city, obs_type=obs_type,
                      seed=args.seed, renderer=renderer, image_size=image_size)
 
@@ -202,7 +203,8 @@ def cmd_serve(args):
     from serve.server import main as serve_main
     serve_main(host=args.host, port=args.port, seed=args.seed, map_size=args.map,
                n_targets=args.targets, traffic=args.traffic, world=args.world,
-               agent=args.agent, manual=args.keys, rate=args.rate)
+               agent=args.agent, manual=args.keys, rate=args.rate,
+               pedestrians=args.pedestrians, speed_signs=args.signs)
 
 
 # ----------------------------------------------------------------------
@@ -217,6 +219,10 @@ def main():
                     help="serve: traffic preset")
     ap.add_argument("--world", default="city", choices=["city", "suburbs", "rural", "industrial"],
                     help="serve: world/terrain preset")
+    ap.add_argument("--pedestrians", action="store_true",
+                    help="zebra crossings with pedestrians (adds a 20-wide observation block)")
+    ap.add_argument("--signs", action="store_true",
+                    help="30/50 km/h zones and signs (adds a 3-wide observation block)")
     ap.add_argument("--agent", default="scripted",
                     help="demo/shots/serve: 'scripted', 'random', 'manual', or a path to "
                          "a custom agent's JSON config (see agents/loader.py)")

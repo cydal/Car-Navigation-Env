@@ -27,6 +27,8 @@
     <label class="check"><input id="overlayChk" type="checkbox" checked> sensors</label>
     <label class="check"><input id="manualChk" type="checkbox"> manual (arrows)</label>
     <label class="check"><input id="autoChk" type="checkbox" checked> auto-restart</label>
+    <label class="check" title="zebra crossings with pedestrians (rebuilds the env: +20 obs dims)"><input id="pedChk" type="checkbox"> pedestrians</label>
+    <label class="check" title="30/50 km/h zones and signs (rebuilds the env: +3 obs dims)"><input id="signChk" type="checkbox"> signs</label>
   </div>
 </header>
 
@@ -63,7 +65,7 @@
     <div class="metrics" id="metrics"></div>
   </div>
   <div class="timeline-wrap"><div class="label">Last 60 s of decisions</div><div class="timeline" id="timeline"></div>
-    <div class="legend"><i class="m-cruise"></i>cruise <i class="m-traffic"></i>traffic <i class="m-clearance"></i>clearance <i class="m-turn"></i>turn <i class="m-signal"></i>signal <i class="m-manual"></i>manual <i class="m-no_safe_heading"></i>no safe heading</div>
+    <div class="legend"><i class="m-cruise"></i>cruise <i class="m-traffic"></i>traffic <i class="m-pedestrian"></i>pedestrian <i class="m-limit"></i>limit <i class="m-clearance"></i>clearance <i class="m-turn"></i>turn <i class="m-signal"></i>signal <i class="m-manual"></i>manual <i class="m-no_safe_heading"></i>no safe heading</div>
   </div>
 </section>
 </div>

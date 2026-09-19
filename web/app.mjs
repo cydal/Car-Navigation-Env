@@ -34,6 +34,7 @@ function connect() {
     // Deep-linkable for screenshotting/sharing a specific setup: ?world=rural&traffic=dense.
     if (params.get('world')) send({ cmd: 'world', world: params.get('world') });
     if (params.get('traffic')) send({ cmd: 'traffic', traffic: params.get('traffic') });
+    if (params.has('pedestrians') || params.has('signs')) send({ cmd: 'street', pedestrians: params.get('pedestrians') === '1', signs: params.get('signs') === '1' });
   };
   ws.onclose = () => { hud.conn(false); hud.banner('Connection lost — retrying…', 'warn'); state.prev = state.curr = null; setTimeout(connect, 1500); };
   ws.onerror = () => ws.close();
@@ -49,6 +50,7 @@ function onReset(m) {
   scene.buildWorld(m);
   hud.reset(m);
   $('seedInput').value = m.seed; $('trafficSel').value = m.traffic; $('worldSel').value = m.world;
+  if (m.street) { $('pedChk').checked = m.street.pedestrians; $('signChk').checked = m.street.speed_signs; }
 }
 
 function onTick(m) {
@@ -72,7 +74,13 @@ function viewState(now) {
   const ego = { ...c.ego, x: lerp(p.ego.x, c.ego.x, t), y: lerp(p.ego.y, c.ego.y, t), heading: lerpAngle(p.ego.heading, c.ego.heading, t), steer: lerp(p.ego.steer, c.ego.steer, t) };
   const n = c.vehicles.x.length, vx = new Array(n), vy = new Array(n), vh = new Array(n);
   for (let i = 0; i < n; i++) { vx[i] = lerp(p.vehicles.x[i], c.vehicles.x[i], t); vy[i] = lerp(p.vehicles.y[i], c.vehicles.y[i], t); vh[i] = lerpAngle(p.vehicles.heading[i], c.vehicles.heading[i], t); }
-  return { ...c, ego, vehicles: { x: vx, y: vy, heading: vh, speed: c.vehicles.speed } };
+  let pedestrians = c.pedestrians;
+  if (p.pedestrians && c.pedestrians && p.pedestrians.x.length === c.pedestrians.x.length) {
+    const k = c.pedestrians.x.length, px = new Array(k), py = new Array(k);
+    for (let i = 0; i < k; i++) { px[i] = lerp(p.pedestrians.x[i], c.pedestrians.x[i], t); py[i] = lerp(p.pedestrians.y[i], c.pedestrians.y[i], t); }
+    pedestrians = { ...c.pedestrians, x: px, y: py };
+  }
+  return { ...c, ego, vehicles: { x: vx, y: vy, heading: vh, speed: c.vehicles.speed }, pedestrians };
 }
 
 const feedEls = Object.fromEntries([...document.querySelectorAll('.feed')].map(el => [el.dataset.cam, el.querySelector('.feed-view')]));
@@ -100,6 +108,9 @@ $('restartBtn').addEventListener('click', () => send({ cmd: 'reset', seed: Numbe
 $('newBtn').addEventListener('click', () => send({ cmd: 'new' }));
 $('trafficSel').addEventListener('change', e => send({ cmd: 'traffic', traffic: e.target.value }));
 $('worldSel').addEventListener('change', e => send({ cmd: 'world', world: e.target.value }));
+const sendStreet = () => send({ cmd: 'street', pedestrians: $('pedChk').checked, signs: $('signChk').checked });
+$('pedChk').addEventListener('change', sendStreet);
+$('signChk').addEventListener('change', sendStreet);
 $('seedInput').addEventListener('change', e => send({ cmd: 'reset', seed: Number(e.target.value) || 0 }));
 $('rateSel').addEventListener('change', e => send({ cmd: 'rate', rate: Number(e.target.value) }));
 $('viewSel').addEventListener('change', e => { scene.view = e.target.value; scene.first = true; savePrefs(); });
