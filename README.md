@@ -633,6 +633,31 @@ Two lessons from tuning it that apply to reward shaping generally:
   correction and oscillated. Pure-pursuit geometry scales the response to how far
   away the aim point is, which is what actually holds a line.
 
+## Agents, replay, and structured sensing
+
+`GapFollower` above is one *implementation* of a decision-maker, not the
+interface itself. `agents/base.py` defines the actual contract every
+controller in this repo follows — `reset()` / `act(obs, info=None)`, reward-free,
+duck-typed rather than requiring inheritance — so an RL policy, a world-model
+planner, or a human at the keyboard are all interchangeable from the env's
+point of view. `python main.py demo --agent random` or `--agent
+configs/my_agent.json` (a small JSON file naming a module, factory, and
+kwargs) both work the same way `--agent scripted` (the default) does; see
+[INTEGRATION.md](INTEGRATION.md#agents-replay-and-structured-sensing) for the
+full contract and config format.
+
+Two things that live next to, but outside, `env/` for the same reason:
+
+- **`replay/`** — `ReplayBuffer` (uniform sampling over single transitions)
+  and `EpisodeBuffer` (contiguous multi-step windows, what a world model's
+  sequence training needs) for whatever training codebase is driving the env.
+  `env/nav_env.py` has zero lines of replay-related code; apply
+  `RecordingWrapper(env, buffer)` from the outside instead.
+- **`env/perception.py`** — occlusion-aware front/left/right/rear camera
+  detections and blind-spot zones, auxiliary like `env.radar` (never in the
+  observation vector). This is what the live viewer's camera badges, FOV
+  wedges and detection outlines actually read.
+
 ## Tests
 
 ```

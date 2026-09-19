@@ -18,6 +18,7 @@ this page is wrong, that suite should fail; if it does not, the suite has a gap.
 - [Running many envs](#running-many-envs)
 - [Image observations](#image-observations)
 - [Notes for world models](#notes-for-world-models)
+- [Agents, replay, and structured sensing](#agents-replay-and-structured-sensing)
 - [Things that will bite you](#things-that-will-bite-you)
 
 ---
@@ -517,6 +518,92 @@ for a latent dynamics model:
 - **Use `obs_slices` for per-block heads or losses.** Reconstruction error on 32
   LIDAR channels will otherwise dominate the 7 traffic-light channels that
   actually carry the decision.
+
+---
+
+## Agents, replay, and structured sensing
+
+Everything above is `CarNavEnv` itself: observation, action, reward, seeding.
+None of it changes depending on *how* you decide what action to take. That
+split is deliberate — an RL policy, a world-model planner, a hand-written
+controller, and a human at the keyboard should all be able to drive this env
+through the exact same `reset()`/`step()` calls, with the env never importing
+or knowing about any of them.
+
+### The `Agent` interface
+
+`agents/base.py` documents the contract every decision-maker in this repo
+follows — `reset()`, `act(obs, info=None)`, and an optional `diagnostics()` for
+a HUD. Duck typing is enough; nothing has to subclass `Agent`. It's
+deliberately reward-free: `act` never receives one, since some approaches
+(rule-based control, MPC over a learned world model, imitation policies at
+inference) have no use for it. `env.step()` still returns a reward every
+call — an RL training loop reads it from there directly, not through an
+Agent.
+
+Built-ins: `agents.load_agent("scripted", env)` (the `baselines.scripted.
+GapFollower` reference controller), `"manual"` (`ManualAgent`, keyboard
+control), `"random"` (`RandomAgent`, the minimal example — read its ~10 lines
+before writing your own). A custom agent is described by a small JSON file
+rather than a bare CLI string, since a real one usually needs more than zero
+constructor arguments (a checkpoint path, a device, ...):
+
+```json
+{
+  "module": "my_world_model.agent",
+  "factory": "PlannerAgent",
+  "kwargs": {"checkpoint": "runs/ckpt_500.pt", "device": "cpu"}
+}
+```
+
+`factory` is looked up on `module` and always called as `factory(env,
+**kwargs)` — a class or a function both work, as long as `env` is the first
+positional argument (even if unused). `python main.py demo --agent
+configs/my_agent.json` and `python main.py serve --agent ...` both take the
+same spec.
+
+### Replay buffers, decoupled from the env
+
+`replay/` (`ReplayBuffer`, `EpisodeBuffer`, `RecordingWrapper`) is a second,
+independent piece of "outside the env" infrastructure — `env/nav_env.py` has
+zero lines of replay-related code; a training codebase uses these directly
+against ordinary `env.step()` calls:
+
+```python
+import carnav
+from replay import ReplayBuffer, RecordingWrapper
+
+env = RecordingWrapper(carnav.make(), ReplayBuffer(capacity=200_000))
+obs, info = env.reset()
+...                                    # buffer fills itself as you step
+batch = env.buffer.sample(256)
+```
+
+`ReplayBuffer` is a ring buffer of raw transitions with uniform sampling —
+the off-policy (DQN/SAC-style) case. `EpisodeBuffer` stores whole episodes and
+samples contiguous multi-step windows (`sample_sequences(batch_size,
+length)`) — what a sequence/world model actually needs for BPTT, which
+`ReplayBuffer`'s i.i.d. sampling can't give you. Both work unchanged whether
+`obs` is the vector, the image, or (`obs_type="both"`) a dict of both, and
+both round-trip through `save(path)`/`load(path)` (stdlib `pickle`, no new
+dependency) for the collect-now-train-later-in-a-different-process workflow.
+`RecordingWrapper` is sugar for calling `buffer.add(...)` by hand every step;
+use whichever fits your loop.
+
+### `env.perception` — structured camera sensing (auxiliary, like `env.radar`)
+
+`env/perception.py` adds occlusion-aware front/left/right/rear camera
+detections and left/right blind-spot zones, computed every `reset()`/`step()`
+and exposed as `env.perception` — same discipline as `env.radar` (see above):
+never concatenated into the observation vector, gated by `EnvConfig(
+perception=True)`, no RNG stream. `env.perception.cameras[name]` is a list of
+`(vehicle_index, distance_m, bearing_rad)` tuples for whichever *other
+vehicles* (not buildings — see the module docstring for why) are in that
+camera's field of view and range and not hidden behind another vehicle;
+`env.perception.blind_spots["left"/"right"]` is `{"occupied": bool,
+"vehicle": index}`. This is what the live viewer's camera-feed badges, FOV
+wedges, and detection outlines actually read — a real answer to "what does
+the car's camera see", not a rendering approximation.
 
 ---
 
