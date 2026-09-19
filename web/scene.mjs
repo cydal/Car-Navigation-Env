@@ -23,6 +23,7 @@ const C = {
   mast: 0x2a2d33, plate: 0x14161a, pole: 0x6f757d, lampGlow: 0xfff0c8,
   lampOn: [0xff2a1a, 0xffd22a, 0x2aff44], lampOff: [0x3a0d0b, 0x3a300b, 0x0b3a10],
   near: new THREE.Color(0xff3d68), far: new THREE.Color(0x4be07a),
+  imagine: 0x8f7cff,   // a world-model agent's imagined rollouts (Agent.diagnostics()["imagined_trajectories"])
 };
 const HEIGHT = 1.35;   // body height every vehicle mesh is fitted to (matches the physics box)
 const SENSOR_COLORS = { front: 0xff8659, left: 0xffb84d, right: 0xffb84d, rear: 0x8f7cff };
@@ -222,6 +223,7 @@ export class Scene {
     const line = color => new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
     this.intentLine = line(C.ego); this.goalLine = line(0xff6ba8);
     this.overlay.add(this.intentLine, this.goalLine);
+    this.imagineLines = [];
     this.resize();
   }
 
@@ -251,6 +253,7 @@ export class Scene {
       this.buildFovWedges(m.cameras);   // built once; the rig never changes between resets
     }
     this.buildDetectionOutlines();
+    this.buildImagineLines();
     this.first = true;
   }
 
@@ -340,6 +343,57 @@ export class Scene {
       o.rotation.y = -view.vehicles.heading[idx];   // same "-heading" convention as the vehicle mesh itself
       o.material.color.setHex(color);
       o.visible = true;
+    }
+  }
+
+  // A pool of ghost-path lines for `Agent.diagnostics()["imagined_trajectories"]"`
+  // (world-model agents like Dreamer, during inference -- see INTEGRATION.md). Not
+  // every agent provides this, so the pool just stays empty/invisible when it doesn't;
+  // nothing else in the viewer depends on it existing.
+  buildImagineLines(maxLines = 8, maxPoints = 24) {
+    if (this.imagineLines.length) return;
+    for (let i = 0; i < maxLines; i++) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(maxPoints * 3), 3));
+      geo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(maxPoints * 3), 3));
+      geo.setDrawRange(0, 0);
+      const mesh = new THREE.Line(geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 }));
+      mesh.visible = false;
+      this.overlay.add(mesh);
+      this.imagineLines.push(mesh);
+    }
+  }
+
+  // Each rollout fades from the brand-violet "imagine" colour (next step) toward a
+  // dim variant of it (the end of the horizon) -- the same near/far colour-lerp
+  // technique the LIDAR fan uses for range, repurposed here for "how far into an
+  // imagined future this point is" rather than "how dangerous". Colour, not alpha,
+  // fades: THREE's vertex colours don't carry alpha without a custom shader, and a
+  // uniform opacity that shrinks as more rollouts are shown keeps a many-sample
+  // imagination from reading as one solid, meaningless blob.
+  updateImagination(view) {
+    const pool = this.imagineLines;
+    if (!pool.length) return;
+    for (const l of pool) l.visible = false;
+    if (!this.overlays) return;
+    const trajs = (view.driver && view.driver.imagined_trajectories) || [];
+    if (!trajs.length) return;
+    const opacity = clamp(0.9 / Math.sqrt(trajs.length), 0.25, 0.9);
+    const nearC = new THREE.Color(C.imagine), farC = nearC.clone().multiplyScalar(0.35), c = new THREE.Color();
+    for (let i = 0; i < pool.length; i++) {
+      const traj = trajs[i];
+      if (!traj || !traj.x || !traj.x.length) continue;
+      const line = pool[i], pos = line.geometry.attributes.position, col = line.geometry.attributes.color;
+      const n = Math.min(traj.x.length, pos.count);
+      for (let k = 0; k < n; k++) {
+        pos.setXYZ(k, traj.x[k], 0.35, traj.y[k]);
+        c.copy(nearC).lerp(farC, n > 1 ? k / (n - 1) : 0);
+        col.setXYZ(k, c.r, c.g, c.b);
+      }
+      pos.needsUpdate = col.needsUpdate = true;
+      line.geometry.setDrawRange(0, n);
+      line.material.opacity = opacity;
+      line.visible = true;
     }
   }
 
@@ -648,6 +702,7 @@ export class Scene {
     }
     if (this.fovWedgeGroup) this.fovWedgeGroup.visible = this.overlays;
     this.updateDetections(view, world);
+    this.updateImagination(view);
 
     // Sun follows the car so the shadow frustum stays tight; sky dome follows the camera.
     this.sun.position.set(e.x + 40, 70, e.y + 30); this.sun.target.position.set(e.x + fx * 15, 0, e.y + fy * 15); this.sun.target.updateMatrixWorld();

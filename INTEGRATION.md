@@ -11,6 +11,7 @@ this page is wrong, that suite should fail; if it does not, the suite has a gap.
 - [Observation](#observation)
 - [Action](#action)
 - [Reward](#reward)
+- [Overriding the reward](#overriding-the-reward)
 - [What to beat](#what-to-beat)
 - [Episode endings and bootstrapping](#episode-endings-and-bootstrapping)
 - [Seeding and reproducibility](#seeding-and-reproducibility)
@@ -19,6 +20,7 @@ this page is wrong, that suite should fail; if it does not, the suite has a gap.
 - [Image observations](#image-observations)
 - [Notes for world models](#notes-for-world-models)
 - [Agents, replay, and structured sensing](#agents-replay-and-structured-sensing)
+- [Visualising a world model's imagination](#visualising-a-world-models-imagination)
 - [Things that will bite you](#things-that-will-bite-you)
 
 ---
@@ -286,6 +288,68 @@ waypoints). A single step can be +100 or −100 against a typical −0.1, so the
 reward distribution is extremely heavy-tailed. Value-based methods generally want
 reward scaling, return normalisation, or a smaller `target_bonus`; that is a
 learner-side decision and the env does not do it for you.
+
+---
+
+## Overriding the reward
+
+Everything above is the reward `CarNavEnv.step()` computes internally, and it
+never changes — that fixed formula is what makes it comparable across runs and
+methods. A training codebase that wants a *different* reward (sparse-only,
+additive shaping on top of it, a different scale, a completely custom scheme)
+does not fork the env; it wraps it, the same way `replay.RecordingWrapper`
+does:
+
+```python
+import carnav
+from wrappers import RewardOverrideWrapper
+
+def sparse_only(obs, action, reward, terminated, truncated, info):
+    return info["reward_components"]["target_bonus"]      # ignore everything else
+
+def plus_lane_bonus(obs, action, reward, terminated, truncated, info):
+    return reward + my_lane_center_bonus(info)             # additive shaping
+
+env = RewardOverrideWrapper(carnav.make(), sparse_only)
+obs, info = env.reset()
+obs, reward, terminated, truncated, info = env.step(action)   # reward is sparse_only's
+```
+
+`reward_fn(obs, action, reward, terminated, truncated, info)` is called on
+every `step()`; whatever it returns is what the caller sees instead of the
+env's own reward. The env still computes its usual reward internally first —
+unchanged, still exactly the formula above, and still what `info[
+"reward_components"]` breaks down — so `reward_fn` can build additively on
+`reward`/`info` (as `plus_lane_bonus` does) or ignore both for a fully custom
+scheme (as `sparse_only` does). `env/nav_env.py` has zero lines of override-
+related code, checked the same way the Agent/replay boundary is: nothing here
+had to change for this to work.
+
+**`RewardOverrideWrapper` composes with `RecordingWrapper`.** Order controls
+what gets recorded:
+
+```python
+from replay import ReplayBuffer, RecordingWrapper
+
+# Records the OVERRIDDEN reward:
+env = RecordingWrapper(RewardOverrideWrapper(carnav.make(), reward_fn), ReplayBuffer(200_000))
+# Records the ENV'S OWN reward, override applied only after step() returns:
+env = RewardOverrideWrapper(RecordingWrapper(carnav.make(), ReplayBuffer(200_000)), reward_fn)
+```
+
+**The one gotcha:** `info["episode_reward"]` is the *env's own* running sum of
+its own formula, computed with no idea this wrapper exists — it will not match
+a running sum of what `reward_fn` returns. This is why the mechanism is a
+wrapper and not an `EnvConfig` flag: the env's internal accounting stays
+correct and auditable no matter what a wrapper on top of it does, at the cost
+of `episode_reward` no longer being *your* number once you override. Track
+your own running return if you override the reward and want to log it.
+
+Checked in `tests/test_integration.py` §7: `reward_fn`'s return value is
+exactly what `step()` hands back, the override actually changes the reward
+(not just wraps a no-op), `info["episode_reward"]` is provably unaffected by
+the override, and unrelated attributes (`.cfg`, `.action_space`, ...) still
+reach the wrapped env through `__getattr__`.
 
 ---
 
@@ -624,6 +688,97 @@ the car's camera see", not a rendering approximation.
 
 ---
 
+## Visualising a world model's imagination
+
+Not every method plans by imagining, and this does not try to generalise
+across all the ones that do — it standardises on the one thing that is
+renderable regardless of what is underneath it: a sequence of predicted
+future `(x, y)` positions. DreamerV3 rolling out its latent dynamics and
+decoding to a position is the motivating case; anything else that can produce
+candidate future poses (an MPC planner's rollouts, a sampling-based planner's
+particles) qualifies the same way. Agents that never imagine anything — the
+large majority — simply never set this and are completely unaffected.
+
+Add an `imagined_trajectories` key to `Agent.diagnostics()`:
+
+```python
+[{"x": [x1, x2, ...], "y": [y1, y2, ...]}, ...]   # one dict per rollout
+```
+
+- **Absolute world-frame metres**, not ego-frame — the same frame `info["x"]`/
+  `info["y"]` already hand the agent every step, so anchoring an imagined
+  rollout to the current pose needs no extra bookkeeping and no coordinate
+  transform the viewer would have to reverse.
+- **Step order starting from the *next* predicted step**, not the current
+  pose (the viewer already knows where the car is).
+- **Any number of rollouts.** One dict for a single mean/expected trajectory,
+  or several for stochastic samples — Dreamer's latent transitions are
+  stochastic, so a handful of samples is the honest way to show what the
+  model actually thinks might happen, not just its mean. The viewer fans them
+  out as separate lines and lowers per-line opacity as the count grows, so
+  many samples read as a spread rather than a solid blob.
+- **Any horizon length**, and it may change between calls — nothing here
+  requires a fixed planning horizon.
+- **Omit the key entirely** (`{}`, the `diagnostics()` default) when there is
+  nothing to imagine. This is the common case; the viewer treats its absence
+  as "nothing to draw," never as an error.
+
+Worked example — decoding a world model's imagined latents into a handful of
+diagnostic rollouts, alongside whatever action the model actually chose:
+
+```python
+import numpy as np
+
+class DreamerAgent:
+    def __init__(self, env, checkpoint, n_samples=3, horizon=16):
+        self.model = load_world_model(checkpoint)
+        self.n_samples, self.horizon = n_samples, horizon
+        self.dt = env.cfg.dt
+        self._latent = None
+        self._pose = None                      # (x, y, heading) anchor for this step
+
+    def reset(self):
+        self._latent = self.model.initial_state()
+
+    def act(self, obs, info=None):
+        self._pose = (info["x"], info["y"], info["heading"]) if info else (0.0, 0.0, 0.0)
+        self._latent, action = self.model.step(self._latent, obs)
+        return action
+
+    def diagnostics(self):
+        # Roll the model's dynamics forward from the current latent, `n_samples`
+        # times, and decode each imagined state to a position. However this
+        # decoding works internally, the output handed to the viewer is always
+        # just world-frame (x, y) -- the viewer never sees a latent.
+        rollouts = self.model.imagine(self._latent, self.horizon, n=self.n_samples)
+        x0, y0, heading0 = self._pose
+        trajs = []
+        for rollout in rollouts:                # rollout: (horizon, 2) local (dx, dy) offsets
+            xs, ys = [], []
+            x, y = x0, y0
+            for dx, dy in rollout:
+                x += dx * np.cos(heading0) - dy * np.sin(heading0)
+                y += dx * np.sin(heading0) + dy * np.cos(heading0)
+                xs.append(float(x)); ys.append(float(y))
+            trajs.append({"x": xs, "y": ys})
+        return {"imagined_trajectories": trajs}
+```
+
+Point `main.py serve` at it (`--agent configs/dreamer.json`, the same JSON-
+config mechanism every custom agent uses) and the rollouts show up
+immediately: translucent lines fanning out from the car in the 3D scene,
+fading toward the end of the horizon, plus an `imagining ×N · H steps` chip
+next to the agent's name in the driver panel — both gated behind the existing
+`sensors` overlay toggle, so turning overlays off hides them along with the
+LIDAR fan and detection boxes. No server-side code has to change for a new
+agent to use this: `serve/server.py` forwards whatever `diagnostics()`
+returns without inspecting its shape (see `agent_diagnostics()` and `_py()`'s
+`np.ndarray` handling in `serve/server.py` — a bare numpy array in the dict is
+fine, it does not have to be pre-converted to a list). Checked in
+`tests/test_viewer.py` §6.
+
+---
+
 ## Things that will bite you
 
 1. **The zero action *is* coasting** -- zero throttle, zero brake. (This
@@ -650,3 +805,6 @@ the car's camera see", not a rendering approximation.
 10. **`traffic=False` and `traffic_lights=False` remove the simulation entity, the
     observation block and the rendered geometry together.** There is no way to
     have an agent penalised for a signal it cannot see.
+11. **`info["episode_reward"]` is not your number under `RewardOverrideWrapper`.**
+    It is the env's own running sum of its own formula, computed with no idea the
+    wrapper exists. Track your own running return if you override the reward.

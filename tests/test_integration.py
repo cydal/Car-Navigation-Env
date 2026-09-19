@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import carnav
 from baselines.scripted import GapFollower
+from wrappers import RewardOverrideWrapper
 
 FAILED = []
 
@@ -373,6 +374,58 @@ else:
     check("CarNavBoth-v0 exposes a Dict observation space",
           sorted(d.unwrapped.observation_space.spaces) == ["image", "vector"])
     d.close()
+
+print()
+print("=" * 70)
+print("7. REWARD OVERRIDE (wrappers.RewardOverrideWrapper)")
+print("=" * 70)
+print("A training codebase must be able to substitute its own reward for the")
+print("env's own, with env/ changing nothing and info['reward_components']")
+print("still carrying the original breakdown underneath the override.\n")
+
+
+def sparse_only(obs, action, reward, terminated, truncated, info):
+    return info["reward_components"]["target_bonus"]
+
+
+env_w = RewardOverrideWrapper(mk(seed=0), sparse_only)
+drv = GapFollower.for_env(env_w)
+mismatches = n_hits = n_steps2 = 0
+for ep in range(20):
+    obs, info = env_w.reset(seed=6000 + ep)
+    drv.reset()
+    while True:
+        obs, r, te, tr, info = env_w.step(drv.act(obs))
+        n_steps2 += 1
+        want = info["reward_components"]["target_bonus"]
+        if abs(r - want) > 1e-9:
+            mismatches += 1
+        if want > 0:
+            n_hits += 1
+        if te or tr:
+            break
+check("reward_fn's return value is exactly what step() hands back",
+      mismatches == 0, f"{mismatches}/{n_steps2} steps mismatched")
+check("the override actually took effect (reward is sparse, not the dense default)",
+      n_hits > 0, f"{n_hits} waypoint-bonus steps out of {n_steps2}")
+
+# The env's own accounting is untouched by the override -- the documented gotcha.
+plain, env_w2 = mk(seed=0), RewardOverrideWrapper(mk(seed=0), sparse_only)
+plain.reset(seed=6000)
+env_w2.reset(seed=6000)
+info_p = info_w = None
+for _ in range(60):
+    a = np.array([0.6, -1.0, 0.1], dtype=np.float32)
+    _, _, te_p, tr_p, info_p = plain.step(a)
+    _, _, te_w, tr_w, info_w = env_w2.step(a)
+    if te_p or tr_p or te_w or tr_w:
+        break
+check("info['episode_reward'] still reflects the env's own formula, not the override",
+      abs(info_p["episode_reward"] - info_w["episode_reward"]) < 1e-9,
+      f"plain={info_p['episode_reward']:.4f} wrapped={info_w['episode_reward']:.4f}")
+
+check("RewardOverrideWrapper passes unrelated attributes through to the env",
+      env_w.cfg is env_w.env.cfg and env_w.action_space is not None)
 
 print()
 print("=" * 70)

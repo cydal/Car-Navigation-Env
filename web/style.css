@@ -73,6 +73,7 @@ input[type=number] { width: 70px; }
 .driver-head #tickRate { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; font-family: var(--mono); }
 .chip { padding: 3px 10px; border-radius: 4px; background: rgba(62,198,255,.14); color: var(--brand); font-weight: 600; font-size: 12px; }
 .chip.manual { background: rgba(143,124,255,.16); color: var(--violet); }
+.chip.imagine { background: rgba(143,124,255,.16); color: var(--violet); font-variant-numeric: tabular-nums; font-family: var(--mono); }
 .comps { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
 .comps li { display: grid; grid-template-columns: 92px 1fr 52px; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); }
 .comps li.live { color: var(--fg); font-weight: 600; }

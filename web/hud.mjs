@@ -44,6 +44,16 @@ export const hud = {
     $('driverDot').className = 'dot live';
     $('tickRate').textContent = `${fmt(1000 / Math.max(1, tickMs), 0)} Hz${m.rate !== 1 ? ` · ${m.rate}×` : ''}`;
     const chip = $('modeChip'); chip.textContent = m.manual ? 'manual' : (d.kind || 'agent'); chip.classList.toggle('manual', m.manual);
+    // Shown only for agents whose diagnostics() carries imagined_trajectories
+    // (world models like DreamerV3, at inference -- see agents/base.py); most
+    // agents never set this, so the chip just stays hidden for them.
+    const trajs = d.imagined_trajectories || [];
+    const imagineChip = $('imagineChip');
+    if (trajs.length) {
+      const horizon = trajs.reduce((mx, t) => Math.max(mx, (t.x || []).length), 0);
+      imagineChip.hidden = false;
+      imagineChip.textContent = `imagining ×${trajs.length} · ${horizon} steps`;
+    } else imagineChip.hidden = true;
 
     // Speed and the driver's target, when the active agent's diagnostics offer
     // one -- GapFollower does (a "cruise speed" it steers toward), a custom

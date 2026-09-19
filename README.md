@@ -67,6 +67,7 @@ Both paths are live, and the cost of each is measured (see Performance).
 | `agents/` | the `Agent` interface (`reset`/`act`/`diagnostics`) plus `scripted`/`manual`/`random` |
 | `baselines/scripted.py` | follow-the-gap + pure-pursuit driver, obs-only (the `scripted` agent) |
 | `replay/` | `ReplayBuffer`, `EpisodeBuffer`, `RecordingWrapper` — outside `env/`, agent-agnostic |
+| `wrappers.py` | `RewardOverrideWrapper` — let a training codebase compute its own reward |
 | `serve/`, `web/` | the live browser viewer: a websocket server plus a Three.js page |
 | `tests/` | core, env, render, integration, perception, street and viewer suites, plus two diagnostic scripts |
 | `tools/figures.py` | regenerates the task/agent-view figures in this README into `docs/` |
@@ -213,6 +214,29 @@ would learn to fear intersections rather than to read signals.
 Which signal you are judged against is decided by **the stop line you crossed**,
 not by where you were pointing (see Design decisions).
 
+### Overriding it
+
+The formula above is what `env.step()` computes internally, and it never
+changes — that fixed, comparable score is the point. A training codebase that
+wants a different reward (sparse-only, additive shaping, a different scale)
+wraps the env instead of forking it:
+
+```python
+import carnav
+from wrappers import RewardOverrideWrapper
+
+def sparse_only(obs, action, reward, terminated, truncated, info):
+    return info["reward_components"]["target_bonus"]   # ignore everything else
+
+env = RewardOverrideWrapper(carnav.make(), sparse_only)
+```
+
+`env/nav_env.py` has zero lines of override-related code — same discipline as
+`agents/` and `replay/`. See
+[INTEGRATION.md](INTEGRATION.md#overriding-the-reward) for the full contract,
+including the one gotcha (`info["episode_reward"]` still tracks the env's own
+formula, not your override).
+
 ## Visualisation
 
 ### Live browser viewer
@@ -244,6 +268,21 @@ for checking the render from a box with no display.
 *The aerial view over the same junction, pedestrians and speed signs on. The lit
 green line is the intended path toward the current waypoint; the minimap
 (bottom-left) tracks the car and remaining waypoints over the full map.*
+
+**Visualising a world model's imagination.** An agent that plans by imagining
+future states — DreamerV3 rolling out its latent dynamics is the motivating
+case — can hand the viewer its imagined rollouts through the same
+`diagnostics()` mechanism the timeline and mode chip already read: a
+`"imagined_trajectories"` key, one dict per rollout, `{"x": [...], "y": [...]}`
+in world-frame metres. The viewer draws each one as a translucent line fanning
+out from the car, fading toward the end of the horizon, and shows an
+`imagining ×N · H steps` chip next to the driver's name — both only appear for
+an agent that actually provides this; every other agent's `sensors` overlay is
+unaffected. Nothing here is RL- or Dreamer-specific: any agent that can
+produce a sequence of predicted `(x, y)` points qualifies, and most agents
+simply never set the key. See
+[INTEGRATION.md](INTEGRATION.md#visualising-a-world-models-imagination) for
+the full contract and a worked example.
 
 ### Panda3D (training only)
 
@@ -615,6 +654,12 @@ Two things that live next to, but outside, `env/` for the same reason:
   detections and blind-spot zones, auxiliary like `env.radar` (never in the
   observation vector). This is what the live viewer's camera badges, FOV
   wedges and detection outlines actually read.
+- **`wrappers.RewardOverrideWrapper`** — a training codebase substitutes its
+  own reward for the env's own; see [Overriding the
+  reward](#overriding-it) above.
+- **`diagnostics()["imagined_trajectories"]`** — a world-model agent's
+  imagined future, drawn by the live viewer; see [Visualising a world model's
+  imagination](#live-browser-viewer) above.
 
 ### Training vs. inference
 
@@ -641,12 +686,19 @@ batch = env.buffer.sample(256)            # train on it however you like
 
 No renderer, no viewer, no agent config — this is the fast headless path meant
 to run on a training box, and the one [`AsyncVectorEnv`/`multiprocessing`
-parallelise](INTEGRATION.md#running-many-envs) unchanged.
+parallelise](INTEGRATION.md#running-many-envs) unchanged. Stack
+`RewardOverrideWrapper` around the same env first if you want a different
+reward than the one above — wrapper order controls what gets recorded:
+`RecordingWrapper(RewardOverrideWrapper(carnav.make(), reward_fn), buffer)`
+logs the override; the other order logs the env's own reward instead.
 
 **Inference** — once you have a trained policy, wrap it as an `Agent`
 (`reset()` / `act(obs, info=None)`, no reward) and it becomes a drop-in for
 `scripted` / `manual` / `random` everywhere those are accepted, via a JSON
-config naming a module, factory and kwargs:
+config naming a module, factory and kwargs. If it's a world model that plans
+by imagining, add `imagined_trajectories` to its `diagnostics()` (see
+[Visualising a world model's imagination](#live-browser-viewer)) and
+`main.py serve` draws it with no further wiring:
 
 ```json
 {"module": "my_world_model.agent", "factory": "PlannerAgent",

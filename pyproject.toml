@@ -25,4 +25,4 @@ dev = ["gymnasium>=0.29", "panda3d>=1.10", "pillow>=9", "websockets>=13"]
 # web/ and the car models are located relative to the source tree, so the viewer
 # needs a checkout (editable install or PYTHONPATH), not a wheel.
 packages = ["env", "render", "baselines", "tasks", "serve", "agents", "replay"]
-py-modules = ["carnav", "main"]
+py-modules = ["carnav", "main", "wrappers"]

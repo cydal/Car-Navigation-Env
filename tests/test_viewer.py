@@ -170,5 +170,45 @@ print("built-ins (scripted/manual/random) + a custom JSON-configured agent : OK"
 
 print()
 print("=" * 62)
+print("6. IMAGINED TRAJECTORIES REACH THE TICK MESSAGE")
+print("=" * 62)
+# A world-model agent's diagnostics() is the one place the Agent contract has a
+# documented, viewer-rendered convention (agents/base.py) rather than a purely
+# free-form dict. This checks the transport, not the rendering: a diagnostics()
+# dict containing bare numpy arrays (the ndarray branch added to serve.server._py)
+# must survive both agent_diagnostics() and a real json.dumps/loads round-trip.
+with tempfile.TemporaryDirectory() as d:
+    sys.path.insert(0, d)
+    with open(os.path.join(d, "imagining_agent.py"), "w") as f:
+        f.write(
+            "import numpy as np\n"
+            "class ImaginingAgent:\n"
+            "    def __init__(self, env):\n"
+            "        pass\n"
+            "    def reset(self):\n"
+            "        pass\n"
+            "    def act(self, obs, info=None):\n"
+            "        return np.zeros(3, dtype=np.float32)\n"
+            "    def diagnostics(self):\n"
+            "        return {'imagined_trajectories': [\n"
+            "            {'x': np.array([1.0, 2.0, 3.0]), 'y': np.array([0.5, 0.4, 0.3])},\n"
+            "            {'x': [1.0, 1.9, 2.7], 'y': [0.5, 0.6, 0.9]},\n"
+            "        ]}\n")
+    cfg2 = os.path.join(d, "imagining_agent.json")
+    with open(cfg2, "w") as f:
+        json.dump({"module": "imagining_agent", "factory": "ImaginingAgent"}, f)
+    s2 = Session(seed=5, map_size=32, traffic="none", agent=cfg2)
+    s2.step()
+    tick2 = json.loads(json.dumps(s2.tick_message()))
+    trajs = tick2["driver"]["imagined_trajectories"]
+    assert tick2["driver"]["kind"] == "ImaginingAgent"
+    assert len(trajs) == 2, trajs
+    assert trajs[0]["x"] == [1.0, 2.0, 3.0] and trajs[0]["y"] == [0.5, 0.4, 0.3], trajs[0]
+    assert trajs[1]["x"] == [1.0, 1.9, 2.7], trajs[1]
+    sys.path.remove(d)
+print("diagnostics() with raw numpy arrays round-trips through the tick message : OK")
+
+print()
+print("=" * 62)
 print("ALL VIEWER CHECKS PASSED")
 print("=" * 62)

@@ -73,11 +73,20 @@ mimetypes.add_type("model/gltf-binary", ".glb")
 
 
 def _py(v):
-    """JSON-safe copy: numpy scalars to Python, floats rounded to 4 dp."""
+    """JSON-safe copy: numpy scalars/arrays to Python, floats rounded to 4 dp.
+
+    Runs over `Agent.diagnostics()` output too (see `agent_diagnostics()` below),
+    which an agent author does not control the shape of as tightly as this
+    server's own state -- a world-model agent's imagined trajectory is exactly
+    the kind of thing that shows up as a bare `np.ndarray`, and without the
+    ndarray branch that would reach `json.dumps` and crash the connection.
+    """
     if isinstance(v, dict):
         return {k: _py(x) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
         return [_py(x) for x in v]
+    if isinstance(v, np.ndarray):
+        return _py(v.tolist())
     if isinstance(v, np.generic):
         v = v.item()
     if isinstance(v, float):

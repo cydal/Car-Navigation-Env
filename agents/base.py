@@ -21,6 +21,26 @@ Subclassing `Agent` is optional -- duck typing is enough, exactly like
 `GapFollower` (baselines/scripted.py) already satisfies this contract without
 inheriting from anything. This class exists to document the shape once and
 give `isinstance` checks somewhere to point at, not to gatekeep.
+
+One `diagnostics()` key is a documented convention rather than a free-for-all
+field, because the live viewer (`serve/`, `web/`) renders it specially:
+`imagined_trajectories`, for agents that plan by imagining -- a world model
+like DreamerV3 rolling out its latent dynamics is the motivating case, but
+anything that can produce candidate future poses qualifies. Shape:
+
+    [{"x": [x1, x2, ...], "y": [y1, y2, ...]}, ...]   # one dict per rollout
+
+Absolute world-frame metres, in step order starting from the *next* predicted
+step (not the current pose) -- the same frame `info["x"]`/`info["y"]` already
+hand an agent every step, so anchoring an imagined rollout to the current pose
+needs no extra bookkeeping. Everything else about it is deliberately
+unconstrained: any number of rollouts (a single mean trajectory, or several
+stochastic samples to show spread), any horizon length, and it is fine to
+change length between calls. Omit the key entirely (the `{}` default) if the
+agent has nothing to imagine -- most agents never will, and the viewer treats
+its absence as "nothing to draw", not an error. See
+INTEGRATION.md#visualising-a-world-models-imagination for the full contract
+and a worked example.
 """
 
 
