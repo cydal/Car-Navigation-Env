@@ -14,15 +14,52 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const srgb = (r, g, b) => new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace);
 
 const C = {
-  skyTop: 0x5c8cc7, skyHorizon: 0xdfe8f1, fog: 0xd6e0ea, ground: 0x7d9963,
   kerb: 0xa9adb3, white: 0xf2f2ee, amber: 0xf1d67a,
   ego: 0xffb020, target: 0x3fd08a, next: 0xffb020,
   mast: 0x2a2d33, plate: 0x14161a, pole: 0x6f757d, lampGlow: 0xfff0c8,
-  facades: [0xd9d0c1, 0xc7ced6, 0xb8a798, 0xa4b2be, 0xcfc0ad, 0x9aa3ae, 0xd3c6b4, 0xb1bcc4],
   lampOn: [0xff2a1a, 0xffd22a, 0x2aff44], lampOff: [0x3a0d0b, 0x3a300b, 0x0b3a10],
   near: new THREE.Color(0xff4d3d), far: new THREE.Color(0x3fd08a),
 };
 const HEIGHT = 1.35;   // body height every vehicle mesh is fitted to (matches the physics box)
+
+// World/terrain presets (server-selected, named in `city.theme`). Each one is just a
+// different bundle of appearance choices over the *same* tile grid `buildCity` always
+// gets -- picking a theme never changes the road network, only what gets drawn on top
+// of the BUILDING tiles (a city tower, a house with a garden, nothing but open field
+// with the odd barn, or a warehouse) and the sky/fog mood.
+//
+// `shape` selects which branch of buildCity's per-tile switch runs:
+//   tower      city skyscraper: fills the tile, windowed facade, flat roof
+//   house      suburb home: smaller than the tile (garden shows through), pitched roof
+//   warehouse  flat-roofed industrial shed, no windows, filling most of the tile
+//   farm       rural: most tiles get NOTHING (the ground plane's field colour shows
+//              through directly), a sparse subset get a barn or a silo
+const THEMES = {
+  city: {
+    sky: [0x5c8cc7, 0xdfe8f1], fog: 0xd6e0ea, fogRange: [70, 380], ground: 0x7d9963,
+    shape: 'tower', heightRange: [6, 24],
+    palette: [0xd9d0c1, 0xc7ced6, 0xb8a798, 0xa4b2be, 0xcfc0ad, 0x9aa3ae, 0xd3c6b4, 0xb1bcc4],
+    curbsLamps: true,
+  },
+  suburbs: {
+    sky: [0x74a8d8, 0xe8eef5], fog: 0xdfe6ee, fogRange: [60, 320], ground: 0x8bab5e,
+    shape: 'house', heightRange: [2.6, 4.4], footprint: [0.55, 0.78],
+    palette: [0xe8d9c3, 0xd9c2b0, 0xc9d6df, 0xefe3d0, 0xd8cdb8, 0xc7b8a0],
+    roofPalette: [0x8a3b2c, 0x6f4a33, 0x4a5a63, 0x7a4a2f],
+    curbsLamps: true,
+  },
+  rural: {
+    sky: [0x8bb6dd, 0xf3ecd2], fog: 0xe9dfc0, fogRange: [90, 420], ground: 0x8a9c4a,
+    shape: 'farm', farmDensity: 0.16,
+    curbsLamps: false,
+  },
+  industrial: {
+    sky: [0x8b98a3, 0xcfd6da], fog: 0xb9c2c8, fogRange: [55, 300], ground: 0x6e6a63,
+    shape: 'warehouse', heightRange: [5, 10],
+    palette: [0x8d9096, 0x7a828c, 0x9c8468, 0x6f7680, 0xab7248],
+    curbsLamps: true,
+  },
+};
 
 // Camera mounts in the ego frame (x forward, z right). `yaw` turns a camera's default -z gaze
 // onto the wanted direction; `physYaw` is the same direction as a physics bearing for the HUD.
@@ -35,9 +72,9 @@ export const FEEDS = {
 
 function flatGeom(w, l) { const g = new THREE.PlaneGeometry(w, l); g.rotateX(-Math.PI / 2); return g; }
 
-function skyDome() {
+function skyDome(topHex, horizonHex) {
   const R = 650, g = new THREE.SphereGeometry(R, 32, 16), pos = g.attributes.position;
-  const col = new Float32Array(pos.count * 3), top = new THREE.Color(C.skyTop), hor = new THREE.Color(C.skyHorizon), c = new THREE.Color();
+  const col = new Float32Array(pos.count * 3), top = new THREE.Color(topHex), hor = new THREE.Color(horizonHex), c = new THREE.Color();
   for (let i = 0; i < pos.count; i++) { c.copy(hor).lerp(top, clamp((pos.getY(i) / R + 0.05) / 0.5, 0, 1)); col.set([c.r, c.g, c.b], i * 3); }
   g.setAttribute('color', new THREE.BufferAttribute(col, 3));
   return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false, toneMapped: false }));
@@ -128,8 +165,9 @@ export class Scene {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.autoClear = false;
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(C.fog, 70, 380);
-    this.sky = skyDome(); this.scene.add(this.sky);
+    this.scene.fog = new THREE.Fog(THEMES.city.fog, ...THEMES.city.fogRange);
+    this.themeName = null;
+    this.sky = skyDome(...THEMES.city.sky); this.scene.add(this.sky);
     this.scene.add(new THREE.HemisphereLight(0xdfe9ff, 0x7a746a, 1.55));
     this.sun = new THREE.DirectionalLight(0xfff0dc, 1.8); this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(2048, 2048); this.sun.shadow.camera.near = 10; this.sun.shadow.camera.far = 260;
@@ -185,36 +223,90 @@ export class Scene {
     this.first = true;
   }
 
+  // Swaps the sky dome and fog to match a theme; a no-op past the first call for a given
+  // theme, so switching worlds every reset doesn't rebuild the (fairly large) sky sphere
+  // when the player is just cycling seeds within the same world.
+  applyTheme(themeName) {
+    const t = THEMES[themeName] || THEMES.city;
+    if (this.themeName !== themeName) {
+      this.themeName = themeName;
+      this.scene.remove(this.sky); this.sky.geometry.dispose(); this.sky.material.dispose();
+      this.sky = skyDome(...t.sky); this.scene.add(this.sky);
+    }
+    this.scene.fog.color.setHex(t.fog);
+    [this.scene.fog.near, this.scene.fog.far] = t.fogRange;
+    return t;
+  }
+
   buildCity(city) {
     const { width: W, height: H, tile_size: ts, grid, v_roads, h_roads, road_width: rw } = city;
     const solid = (r, c) => r < 0 || r >= H || c < 0 || c >= W || grid.charCodeAt(r * W + c) === 49;
     const g = this.worldGroup, box = new THREE.BoxGeometry(1, 1, 1);
     const std = extra => new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0, ...extra });
+    const theme = this.applyTheme(city.theme || 'city');
 
-    const ground = new THREE.Mesh(flatGeom(W * ts * 4, H * ts * 4), std({ color: C.ground, roughness: 1 }));
+    const ground = new THREE.Mesh(flatGeom(W * ts * 4, H * ts * 4), std({ color: theme.ground, roughness: 1 }));
     ground.position.set(W * ts / 2, -0.03, H * ts / 2); ground.receiveShadow = true; g.add(ground);
 
-    const bld = [], roofs = [], roads = [], kerbs = [], posts = [];
+    // `towerBoxes` gets the windowed shader (city skyscrapers only); `plainBoxes` covers
+    // every other solid-colour building body (house / warehouse / barn) so those themes
+    // never pay for, or accidentally show, the window pattern.
+    const towerBoxes = [], plainBoxes = [], flatRoofs = [], pitchRoofs = [];
+    const silos = [], siloCaps = [];
+    const roads = [], kerbs = [], posts = [];
+    const [hMin, hMax] = theme.heightRange || [6, 24];
     const SIDES = [[1, 0, 0, 1], [-1, 0, 0, -1], [0, 1, 1, 0], [0, -1, -1, 0]];   // [dr, dc, nx, ny]
     for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
       const cx = (c + 0.5) * ts, cy = (r + 0.5) * ts;
-      if (solid(r, c)) {
-        const h = 6 + 18 * hash01(r, c), shade = 0.42 + 0.30 * hash01(c, r);
-        const base = new THREE.Color(C.facades[Math.floor(hash01(r * 3 + 1, c * 7 + 2) * C.facades.length)]).multiplyScalar(0.8 + 0.45 * shade);
-        bld.push({ pos: V(cx, cy, h / 2), scale: new THREE.Vector3(ts, h, ts), color: base });
-        roofs.push({ pos: V(cx, cy, h + 0.1), scale: new THREE.Vector3(ts - 0.5, 0.2, ts - 0.5), color: base.clone().multiplyScalar(1.12) });
-        for (const [dr, dc, nx, ny] of SIDES) if (!solid(r + dr, c + dc)) {
-          const fx = cx + nx * ts / 2, fy = cy + ny * ts / 2;
-          kerbs.push({ pos: V(fx + nx * 0.14, fy + ny * 0.14, 0.07), scale: new THREE.Vector3(nx ? 0.28 : ts, 0.14, nx ? ts : 0.28) });
-          if ((nx ? r : c) % 6 === 3) posts.push({ x: fx + nx * 0.16, y: fy + ny * 0.16, nx, ny });
-        }
-      } else {
+      if (!solid(r, c)) {
         const tone = 0.27 + 0.07 * hash01(r * 7 + 1, c * 13 + 3);
         roads.push({ pos: V(cx, cy, 0), color: srgb(tone, tone * 1.03, tone * 1.08) });
+        continue;
+      }
+      const shade = 0.42 + 0.30 * hash01(c, r);
+      const h = hMin + (hMax - hMin) * hash01(r, c);
+      if (theme.shape === 'tower') {
+        const base = new THREE.Color(theme.palette[Math.floor(hash01(r * 3 + 1, c * 7 + 2) * theme.palette.length)]).multiplyScalar(0.8 + 0.45 * shade);
+        towerBoxes.push({ pos: V(cx, cy, h / 2), scale: new THREE.Vector3(ts, h, ts), color: base });
+        flatRoofs.push({ pos: V(cx, cy, h + 0.1), scale: new THREE.Vector3(ts - 0.5, 0.2, ts - 0.5), color: base.clone().multiplyScalar(1.12) });
+      } else if (theme.shape === 'house') {
+        const [fMin, fMax] = theme.footprint;
+        const fx = ts * (fMin + (fMax - fMin) * hash01(c + 5, r + 9));   // smaller than the tile -- the gap reads as a garden
+        const fz = fx * 0.85;
+        const base = new THREE.Color(theme.palette[Math.floor(hash01(r * 3 + 1, c * 7 + 2) * theme.palette.length)]).multiplyScalar(0.85 + 0.3 * shade);
+        plainBoxes.push({ pos: V(cx, cy, h / 2), scale: new THREE.Vector3(fx, h, fz), color: base });
+        const roofCol = new THREE.Color(theme.roofPalette[Math.floor(hash01(r + 2, c + 3) * theme.roofPalette.length)]);
+        pitchRoofs.push({ pos: V(cx, cy, h + fx * 0.32), scale: new THREE.Vector3(fx * 0.98, fx * 0.62, fz * 0.98), rotY: Math.PI / 4, color: roofCol });
+      } else if (theme.shape === 'warehouse') {
+        const base = new THREE.Color(theme.palette[Math.floor(hash01(r * 3 + 1, c * 7 + 2) * theme.palette.length)]).multiplyScalar(0.85 + 0.3 * shade);
+        plainBoxes.push({ pos: V(cx, cy, h / 2), scale: new THREE.Vector3(ts * 0.94, h, ts * 0.94), color: base });
+        flatRoofs.push({ pos: V(cx, cy, h + 0.08), scale: new THREE.Vector3(ts * 0.94, 0.16, ts * 0.94), color: base.clone().multiplyScalar(0.82) });
+      } else if (theme.shape === 'farm') {
+        // Most tiles get nothing at all -- the ground plane's field colour shows straight
+        // through, which is the whole point (open countryside, not a walled-off lot).
+        if (hash01(r * 5 + 2, c * 5 + 7) < theme.farmDensity) {
+          const s = 0.8 + 0.5 * hash01(c, r);
+          if (hash01(r + 11, c + 13) < 0.5) {
+            plainBoxes.push({ pos: V(cx, cy, 2.6 * s), scale: new THREE.Vector3(4.2 * s, 5.2 * s, 3.4 * s), color: new THREE.Color(0xb43f34) });
+            pitchRoofs.push({ pos: V(cx, cy, 5.2 * s + 1.4 * s), scale: new THREE.Vector3(3.7 * s, 2.6 * s, 3.7 * s), rotY: Math.PI / 4, color: new THREE.Color(0x3a3f46) });
+          } else {
+            silos.push({ pos: V(cx, cy, 3.0 * s), scale: new THREE.Vector3(1.7 * s, 6.0 * s, 1.7 * s), color: new THREE.Color(0xc9ccd0) });
+            siloCaps.push({ pos: V(cx, cy, 6.0 * s + 0.9 * s), scale: new THREE.Vector3(1.9 * s, 1.8 * s, 1.9 * s), color: new THREE.Color(0x9aa0a6) });
+          }
+        }
+      }
+      if (theme.curbsLamps) for (const [dr, dc, nx, ny] of SIDES) if (!solid(r + dr, c + dc)) {
+        const fx = cx + nx * ts / 2, fy = cy + ny * ts / 2;
+        kerbs.push({ pos: V(fx + nx * 0.14, fy + ny * 0.14, 0.07), scale: new THREE.Vector3(nx ? 0.28 : ts, 0.14, nx ? ts : 0.28) });
+        if ((nx ? r : c) % 6 === 3) posts.push({ x: fx + nx * 0.16, y: fy + ny * 0.16, nx, ny });
       }
     }
-    g.add(instanced(box, facadeMaterial(), bld, true));
-    g.add(instanced(box, std({}), roofs));
+    g.add(instanced(box, facadeMaterial(), towerBoxes, true));
+    g.add(instanced(box, std({}), plainBoxes, true));
+    g.add(instanced(box, std({}), flatRoofs));
+    g.add(instanced(new THREE.ConeGeometry(0.5, 1, 4), std({}), pitchRoofs));
+    g.add(instanced(new THREE.CylinderGeometry(0.5, 0.5, 1, 16), std({ metalness: 0.3, roughness: 0.5 }), silos, true));
+    g.add(instanced(new THREE.ConeGeometry(0.5, 1, 16), std({ metalness: 0.3, roughness: 0.5 }), siloCaps));
     g.add(instanced(flatGeom(ts, ts), std({ roughness: 0.95 }), roads));
     g.add(instanced(box, std({ color: C.kerb }), kerbs));
     g.add(instanced(new THREE.CylinderGeometry(0.05, 0.07, 5.2, 8), std({ color: C.pole, roughness: 0.5, metalness: 0.4 }), posts.map(p => ({ pos: V(p.x, p.y, 2.6) }))));

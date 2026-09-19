@@ -29,7 +29,12 @@ function send(obj) { if (state.ws && state.ws.readyState === 1) state.ws.send(JS
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => { hud.conn(true); hud.banner(null); send({ cmd: 'auto', on: $('autoChk').checked }); };
+  ws.onopen = () => {
+    hud.conn(true); hud.banner(null); send({ cmd: 'auto', on: $('autoChk').checked });
+    // Deep-linkable for screenshotting/sharing a specific setup: ?world=rural&traffic=dense.
+    if (params.get('world')) send({ cmd: 'world', world: params.get('world') });
+    if (params.get('traffic')) send({ cmd: 'traffic', traffic: params.get('traffic') });
+  };
   ws.onclose = () => { hud.conn(false); hud.banner('Connection lost — retrying…', 'warn'); state.prev = state.curr = null; setTimeout(connect, 1500); };
   ws.onerror = () => ws.close();
   ws.onmessage = e => {
@@ -43,7 +48,7 @@ function onReset(m) {
   state.world = m; state.prev = state.curr = null; state.lastIntent = null;
   scene.buildWorld(m);
   hud.reset(m);
-  $('seedInput').value = m.seed; $('trafficSel').value = m.traffic;
+  $('seedInput').value = m.seed; $('trafficSel').value = m.traffic; $('worldSel').value = m.world;
 }
 
 function onTick(m) {
@@ -94,6 +99,7 @@ $('stepBtn').addEventListener('click', () => send({ cmd: 'step' }));
 $('restartBtn').addEventListener('click', () => send({ cmd: 'reset', seed: Number($('seedInput').value) || 0 }));
 $('newBtn').addEventListener('click', () => send({ cmd: 'new' }));
 $('trafficSel').addEventListener('change', e => send({ cmd: 'traffic', traffic: e.target.value }));
+$('worldSel').addEventListener('change', e => send({ cmd: 'world', world: e.target.value }));
 $('seedInput').addEventListener('change', e => send({ cmd: 'reset', seed: Number(e.target.value) || 0 }));
 $('rateSel').addEventListener('change', e => send({ cmd: 'rate', rate: Number(e.target.value) }));
 $('viewSel').addEventListener('change', e => { scene.view = e.target.value; scene.first = true; savePrefs(); });

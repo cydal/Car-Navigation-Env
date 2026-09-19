@@ -12,13 +12,14 @@
 <canvas id="scene"></canvas>
 <div class="ui">
 <header class="topbar">
-  <div class="brand"><span class="logo">CarNav</span><span class="word">Live</span><small>Python simulation · Three.js viewer</small></div>
+  <div class="brand"><span class="logo">DelveLabsNav</span><span class="word">Live</span><small>Python simulation</small></div>
   <div class="controls">
     <span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting</span></span>
     <button id="startBtn" class="primary">Pause</button>
     <button id="stepBtn" title="Advance one step while paused (.)">Step</button>
     <button id="restartBtn" title="Restart the same map (R)">Restart</button>
     <button id="newBtn" title="New random map (N)">New map</button>
+    <label>World <select id="worldSel"><option value="city" selected>city</option><option value="suburbs">suburbs</option><option value="rural">rural</option><option value="industrial">industrial</option></select></label>
     <label>Traffic <select id="trafficSel"><option value="none">none</option><option value="light">light</option><option value="normal" selected>normal</option><option value="dense">dense</option></select></label>
     <label>Seed <input id="seedInput" type="number" min="0" max="99999" value="0"></label>
     <label>Rate <select id="rateSel"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
@@ -30,7 +31,7 @@
 </header>
 
 <aside class="feeds">
-  <div class="panel-title">What the car senses</div>
+  <div class="panel-title">Car Cameras</div>
   <div class="feed" data-cam="front"><div class="feed-view"></div><div class="feed-label"><b>Front camera</b><span>200 m · 70°</span><em>0</em></div></div>
   <div class="feed" data-cam="left"><div class="feed-view"></div><div class="feed-label"><b>Left camera</b><span>30 m · 120°</span><em>0</em></div></div>
   <div class="feed" data-cam="right"><div class="feed-view"></div><div class="feed-label"><b>Right camera</b><span>30 m · 120°</span><em>0</em></div></div>
@@ -43,10 +44,7 @@
 </aside>
 
 <aside class="driver">
-  <div class="driver-head"><span class="dot" id="driverDot"></span><b>Driver decides</b><span class="chip" id="modeChip">scripted</span><span id="tickRate">— Hz</span></div>
-  <div class="decision"><div class="label">Intent</div><div class="big" id="intentBig">waiting for the first tick</div><div class="exec" id="execLine"></div></div>
-  <div class="label">Speed caps · km/h</div>
-  <ul class="caps" id="capsList"></ul>
+  <div class="driver-head"><span class="dot" id="driverDot"></span><b>Status</b><span class="chip" id="modeChip">scripted</span><span id="tickRate">— Hz</span></div>
   <div class="label">Reward</div>
   <div class="reward"><div><b id="epReward">0.0</b><span>episode</span></div><div><b id="stepReward">+0.00</b><span>this step</span></div></div>
   <ul class="comps" id="compList"></ul>

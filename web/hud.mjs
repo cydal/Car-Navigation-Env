@@ -1,5 +1,12 @@
-// DOM side of the viewer: speed, driver intent and speed caps, reward and its components,
-// sensor summaries, minimap, route progress, decision timeline, banners and the end card.
+// DOM side of the viewer: speed, reward and its components, sensor summaries, minimap,
+// route progress, a decision-history timeline, banners and the end card.
+//
+// This intentionally does not narrate *why* the driver picked a speed (no "intent" line,
+// no per-cap breakdown) -- that framing came from the LLM-driver reference this viewer took
+// inspiration from, where the model's structured answer *was* the interesting thing to show.
+// Our driver is a classical controller, so its speed cap isn't a "decision" worth explaining
+// step by step; the timeline below still records which cap most recently bound, as a coarse
+// history, without dressing it up as commentary.
 import { FEEDS } from '/scene.mjs';
 
 const $ = id => document.getElementById(id);
@@ -7,13 +14,11 @@ const fmt = (v, d = 0) => (v === null || v === undefined || !Number.isFinite(v))
 const COMPASS = ['front', 'front-right', 'right', 'rear-right', 'rear', 'rear-left', 'left', 'front-left'];
 const compass = rad => COMPASS[((Math.round(rad / (Math.PI / 4)) % 8) + 8) % 8];
 const INTENT = { cruise: 'Cruise', traffic: 'Follow the traffic', clearance: 'Hold back for clearance', turn: 'Ease off while steering', signal: 'Stop for the signal', manual: 'Manual drive', no_safe_heading: 'No safe heading', starting: 'Starting' };
-const CAPS = ['cruise', 'clearance', 'turn', 'signal', 'traffic'];
 const COMPS = { progress: 'progress', time: 'time', target_bonus: 'waypoint', red_light: 'red light', crash: 'crash' };
 const ENDINGS = { success: ['Route complete', 'good'], crash: ['Crashed', 'bad'], stuck: ['Stuck', 'bad'], timeout: ['Out of time', 'bad'] };
 
 export const hud = {
   init() {
-    $('capsList').innerHTML = CAPS.map(c => `<li data-c="${c}"><span>${c}</span><span class="bar"><i></i></span><span class="val">—</span></li>`).join('');
     $('compList').innerHTML = Object.entries(COMPS).map(([k, label]) => `<li data-c="${k}"><span>${label}</span><span class="bar"><i></i></span><span class="val">—</span></li>`).join('');
     this.timeline = []; this.mapBase = null; this.mapExtent = [1, 1];
   },
@@ -29,9 +34,8 @@ export const hud = {
     this.mapBase = off; this.mapExtent = [W * tile_size, H * tile_size];
     this.timeline = []; $('timeline').innerHTML = '';
     $('wpDots').innerHTML = Array.from({ length: world.cfg.n_targets }, () => '<i></i>').join('');
-    $('runInfo').textContent = `seed ${world.seed} · ${world.traffic} traffic · episode ${world.episode}`;
+    $('runInfo').textContent = `seed ${world.seed} · ${world.world} · ${world.traffic} traffic · episode ${world.episode}`;
     $('statEp').textContent = world.episode;
-    $('intentBig').textContent = 'starting'; $('intentBig').dataset.m = ''; $('execLine').textContent = '';
     $('endCard').hidden = true;
   },
 
@@ -48,20 +52,6 @@ export const hud = {
     ring.textContent = d.mode === 'scripted' && d.target_speed !== undefined ? Math.round(d.target_speed * 3.6) : '—';
     ring.classList.toggle('over', kmh > cruise + 2);
     $('postedNote').textContent = d.mode === 'scripted' ? `driver target · cruise ${Math.round(cruise)}` : 'manual · arrows drive';
-
-    // Intent.
-    const intent = d.intent || 'starting';
-    $('intentBig').textContent = INTENT[intent] || intent; $('intentBig').dataset.m = intent;
-    if (d.mode === 'scripted' && typeof d.theta_deg === 'number') {
-      const side = d.theta_deg > 2 ? 'right' : d.theta_deg < -2 ? 'left' : 'ahead';
-      $('execLine').textContent = `heading ${Math.abs(d.theta_deg).toFixed(0)}° ${side} · target ${Math.round(d.target_speed * 3.6)} km/h · clearance ${fmt(d.chosen_clear, 0)} m (needs ${fmt(d.need, 0)} m)${d.in_corridor ? ' · centring in corridor' : ''}`;
-    } else $('execLine').textContent = m.manual ? `throttle ${fmt(m.action[0], 2)} · steer ${fmt(m.action[2], 2)}` : '';
-    for (const li of document.querySelectorAll('#capsList li')) {
-      const cap = d.caps ? d.caps[li.dataset.c] : null, ok = cap !== null && cap !== undefined;
-      li.querySelector('i').style.width = ok ? `${Math.round(Math.min(1, cap / Math.max(0.1, d.cruise || 1)) * 100)}%` : '0%';
-      li.querySelector('.val').textContent = ok ? `${Math.round(cap * 3.6)}` : '—';
-      li.classList.toggle('chosen', li.dataset.c === intent);
-    }
 
     // Reward.
     $('epReward').textContent = fmt(info.episode_reward, 1);
