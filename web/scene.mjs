@@ -306,6 +306,7 @@ export class Scene {
       const len = v.length[idx] ?? 4.4, wid = v.width[idx] ?? 1.9;
       o.scale.set(wid + 0.2, HEIGHT + 0.15, len + 0.2);
       o.position.set(view.vehicles.x[idx], (HEIGHT + 0.15) / 2, view.vehicles.y[idx]);
+      o.rotation.y = -view.vehicles.heading[idx];   // same "-heading" convention as the vehicle mesh itself
       o.material.color.setHex(color);
       o.visible = true;
     }
