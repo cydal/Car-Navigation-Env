@@ -17,7 +17,7 @@ except ImportError:
     print("websockets not installed -- viewer checks skipped (pip install websockets)")
     sys.exit(0)
 
-from serve.server import Session, Server, TRAFFIC_PRESETS  # noqa: E402
+from serve.server import Session, Server, TRAFFIC_PRESETS, WORLD_PRESETS  # noqa: E402
 
 INTENTS = {"cruise", "traffic", "clearance", "turn", "signal", "manual",
            "no_safe_heading", "starting"}
@@ -83,6 +83,23 @@ assert s.paused
 srv.handle({"cmd": "step"})
 assert s.step_once
 print("mode / keys / traffic / reset / rate / pause / step : OK")
+
+print()
+print("=" * 62)
+print("3b. WORLD PRESETS")
+print("=" * 62)
+for name in WORLD_PRESETS:
+    s.build(seed=5, traffic="normal", world=name)
+    r = json.loads(json.dumps(s.reset_message()))
+    assert r["world"] == name and r["city"]["theme"] == WORLD_PRESETS[name][0]
+    assert len(r["city"]["grid"]) == r["city"]["width"] * r["city"]["height"]
+    s.step()
+s.build(s.seed, "dense", world="city")
+srv.handle({"cmd": "world", "world": "rural"})
+assert s.world == "rural" and s.traffic_preset == "dense", "world switch must keep the current traffic preset"
+srv.handle({"cmd": "world", "world": "not-a-world"})
+assert s.world == "rural", "unknown world preset must be ignored"
+print(f"presets {sorted(WORLD_PRESETS)}, switching preserves traffic preset : OK")
 
 print()
 print("=" * 62)

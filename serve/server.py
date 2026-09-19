@@ -42,6 +42,26 @@ CAR_DIR = ROOT / "kenney_car-kit" / "Models" / "GLB format"
 # (moving, parked). Every preset keeps the same observation layout -- the
 # traffic block pads empty slots -- so the driver sees the same 73-D vector.
 TRAFFIC_PRESETS = {"none": (0, 0), "light": (4, 10), "normal": (8, 18), "dense": (14, 30)}
+
+# World/terrain presets: (theme, CityConfig overrides). `theme` is a plain string
+# handed to the client so the renderer can pick a matching palette and building
+# style -- it changes nothing about the simulation, which only ever sees the
+# CityConfig overrides below (block sizes, road width, signal density, map
+# extent). All four still generate the *same* ROAD/BUILDING tile grid the rest
+# of the sim depends on (collision, LIDAR, traffic routing, parking spots), so
+# this is purely additive: no new world-generation code, just different knobs
+# on the existing generator.
+WORLD_PRESETS = {
+    "city": ("city", {}),
+    "suburbs": ("suburbs", dict(
+        min_block=5, max_block=9, plaza_prob=0.18, block_segment_prob=0.16, max_signals=4)),
+    "rural": ("rural", dict(
+        width=60, height=60, min_block=11, max_block=20, plaza_prob=0.04,
+        block_segment_prob=0.03, max_signals=2, signal_min_sep=70.0)),
+    "industrial": ("industrial", dict(
+        min_block=6, max_block=11, road_width=4, plaza_prob=0.22,
+        block_segment_prob=0.10, max_signals=3)),
+}
 RESTART_DELAY_S = 3.0
 INFO_KEYS = ("episode_reward", "dist_to_target", "target_bearing", "targets_reached",
              "n_targets", "reason", "red_light_violations", "crash_with", "is_success",
@@ -71,7 +91,7 @@ def _arr(a, nd=3):
 class Session:
     """One env + driver, stepped in real time, serialised for the browser."""
 
-    def __init__(self, seed=0, map_size=48, n_targets=3, traffic="normal",
+    def __init__(self, seed=0, map_size=48, n_targets=3, traffic="normal", world="city",
                  manual=False, rate=1.0):
         self.map_size = map_size
         self.n_targets = n_targets
@@ -83,13 +103,20 @@ class Session:
         self.keys = {"up": False, "down": False, "left": False, "right": False}
         self.episode = 0
         self.seed = int(seed)
-        self.build(self.seed, traffic)
+        self.build(self.seed, traffic, world)
 
-    def build(self, seed, traffic):
+    def build(self, seed, traffic, world=None):
+        if world is None:
+            world = getattr(self, "world", "city")
+        self.world = world if world in WORLD_PRESETS else "city"
+        theme, city_overrides = WORLD_PRESETS[self.world]
+        self.theme = theme
         n_moving, n_parked = TRAFFIC_PRESETS[traffic]
         self.traffic_preset = traffic
         cfg = EnvConfig(n_targets=self.n_targets, n_traffic=n_moving, n_parked=n_parked)
-        city = CityConfig(width=self.map_size, height=self.map_size)
+        city_kwargs = dict(width=self.map_size, height=self.map_size)
+        city_kwargs.update(city_overrides)
+        city = CityConfig(**city_kwargs)
         self.env = CarNavEnv(config=cfg, city_config=city, obs_type="vector", seed=seed)
         self.driver = GapFollower.for_env(self.env)
         self.reset(seed)
@@ -181,11 +208,11 @@ class Session:
         car = env.car.p
         return {
             "type": "reset", "episode": self.episode, "seed": self.seed,
-            "traffic": self.traffic_preset,
+            "traffic": self.traffic_preset, "world": self.world,
             "city": {
                 "width": city.width, "height": city.height, "tile_size": city.tile_size,
                 "grid": "".join(map(str, city.grid.ravel().tolist())),
-                "road_width": city.cfg.road_width,
+                "road_width": city.cfg.road_width, "theme": self.theme,
                 "v_roads": city.v_roads, "h_roads": city.h_roads,
                 "signals": _arr(np.asarray(city.signals, dtype=float).reshape(-1, 2)),
             },
@@ -281,6 +308,11 @@ class Server:
             preset = cmd.get("traffic")
             if preset in TRAFFIC_PRESETS:
                 s.build(s.seed, preset)
+                self.send_all(s.reset_message())
+        elif kind == "world":
+            world = cmd.get("world")
+            if world in WORLD_PRESETS:
+                s.build(s.seed, s.traffic_preset, world=world)
                 self.send_all(s.reset_message())
         elif kind == "mode":
             s.manual = bool(cmd.get("manual"))
