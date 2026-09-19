@@ -33,7 +33,7 @@ virtualenv dedicated to the project.
 ```bash
 pip install -e .              # numpy only
 pip install -e '.[gym]'       # + gymnasium: gym.make ids, wrappers, vector envs
-pip install -e '.[render]'    # + panda3d, pillow: image obs, demo window
+pip install -e '.[render]'    # + panda3d, pillow: image observations
 ```
 
 **2. No install.** Put the repo root on the path; this is what `tests/` does.
@@ -192,7 +192,7 @@ again; do consider scaling **reward** (below).
 ### Auxiliary sensors (not in the observation)
 
 `env.radar` is a per-sector (default 8) nearest-*moving*-vehicle range +
-closing-speed sensor, built for the demo HUD's radar readout — not for
+closing-speed sensor, built for the live viewer's radar readout — not for
 training. It updates every `reset`/`step` but is never concatenated into the
 vector observation, so `vector_dim`/`obs_slices` above are unaffected by it
 regardless of `EnvConfig(radar=..., n_radar_sectors=..., radar_range=...)`.
@@ -489,10 +489,15 @@ Four constraints, all of them load-bearing:
   than silently rescaling if asked for a different size, so build the renderer at
   the resolution you intend to train on.
 - **The camera is stateless** — `capture` is a pure function of car pose, and
-  `test_render` asserts byte-identical frames across two runs of a seed. Camera
-  smoothing (`--smooth`) breaks that and exists for watching, not training.
-- **Offscreen suppresses the minimap and the proximity ring**, so debug overlays
-  never enter an image observation.
+  `test_render` asserts byte-identical frames across two runs of a seed. There
+  is no camera-smoothing option to accidentally leave on; smoothing would make
+  the image depend on history, which breaks both determinism and the Markov
+  property the vector state works hard to preserve.
+- **There is no HUD, minimap or camera picture-in-picture to suppress.**
+  `PandaRenderer` has no human-facing UI at all any more — that job belongs to
+  the live browser viewer (`serve/`, `web/`), a separate process watching the
+  simulation over a websocket. `capture()` renders exactly what it always did:
+  the chase-camera view, nothing composited on top of it.
 
 Each frame is a fresh array (`.copy()` internally), safe to put straight into a
 replay buffer.
@@ -570,8 +575,8 @@ constructor arguments (a checkpoint path, a device, ...):
 
 `factory` is looked up on `module` and always called as `factory(env,
 **kwargs)` — a class or a function both work, as long as `env` is the first
-positional argument (even if unused). `python main.py demo --agent
-configs/my_agent.json` and `python main.py serve --agent ...` both take the
+positional argument (even if unused). `python main.py serve --agent
+configs/my_agent.json` and `python main.py shots --agent ...` both take the
 same spec.
 
 ### Replay buffers, decoupled from the env

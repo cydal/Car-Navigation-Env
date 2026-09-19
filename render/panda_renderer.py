@@ -1,8 +1,12 @@
 """
-Third-person Panda3D renderer for CarNavEnv.
+Third-person Panda3D renderer for CarNavEnv -- training-only image observations.
 
 This module is *only* imported when images are actually wanted -- the simulation
-core never touches it, so headless training never loads a graphics stack.
+core never touches it, so headless training never loads a graphics stack. It has
+no human-facing UI of its own (no minimap, no camera picture-in-picture, no HUD):
+that job belongs to the live browser viewer (`serve/`, `web/`), which watches the
+simulation over a websocket instead of sharing a process with it. What is left
+here renders exactly the pixels `capture()` hands back as an image observation.
 
 Two design constraints drove the implementation:
 
@@ -17,8 +21,7 @@ Two design constraints drove the implementation:
    no frame-to-frame carry-over. A smoothed chase camera looks nicer to a human
    but makes the image observation depend on history, which silently breaks both
    determinism under a fixed seed and the Markov property the vector state is
-   careful to preserve. Smoothing is available but defaults off; turn it on for
-   watching, not for training.
+   careful to preserve.
 """
 
 import os
@@ -58,14 +61,10 @@ if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
     loadPrcFileData("", "load-display p3headlessgl")
 
 from panda3d.core import (  # noqa: E402
-    AmbientLight, Camera, CardMaker, DirectionalLight, Fog, Geom, GeomNode,
-    GeomTriangles, GeomVertexArrayFormat, GeomVertexData, GeomVertexFormat,
-    GraphicsOutput, InternalName, LineSegs, NodePath, PerspectiveLens, Texture,
-    TextNode, Vec3, Vec4,
+    AmbientLight, DirectionalLight, Fog, Geom, GeomNode, GeomTriangles,
+    GeomVertexArrayFormat, GeomVertexData, GeomVertexFormat, GraphicsOutput,
+    InternalName, NodePath, Texture, Vec3, Vec4,
 )
-from direct.gui.OnscreenText import OnscreenText
-
-from . import theme
 
 # position + normal + rgba, all float32 -- matches VERTEX_DTYPE below byte for byte.
 _afmt = GeomVertexArrayFormat()
@@ -183,25 +182,13 @@ class PandaRenderer:
     """Renders CarNavEnv from a chase camera to an RGB array or a window."""
 
     def __init__(self, offscreen=True, size=64, fov=60.0,
-                 cam_dist=13.0, cam_height=6.5, look_ahead=9.0, smooth=0.0,
-                 build_min=6.0, build_max=24.0, show_rays=None, show_minimap=None,
-                 show_cameras=None):
+                 cam_dist=13.0, cam_height=6.5, look_ahead=9.0,
+                 build_min=6.0, build_max=24.0):
         self.size = (size, size) if isinstance(size, int) else tuple(size)
         self.offscreen = offscreen
         self.cam_dist = cam_dist
         self.cam_height = cam_height
         self.look_ahead = look_ahead
-        self.smooth = smooth          # 0 = stateless (required for training)
-        # Proximity ring defaults on for onscreen windows, off for offscreen so
-        # it never appears in training image observations.
-        self.show_rays = show_rays if show_rays is not None else (not offscreen)
-        # Minimap is on by default for onscreen (demo) windows, off for offscreen
-        # (training image captures) so the map overlay never enters training obs.
-        self.show_minimap = show_minimap if show_minimap is not None else (not offscreen)
-        # Front/left/right picture-in-picture camera feeds -- same on/off-by-
-        # offscreen discipline as show_rays/show_minimap, for the same reason:
-        # they must never leak into a training image observation.
-        self.show_cameras = show_cameras if show_cameras is not None else (not offscreen)
         self.build_min = build_min
         self.build_max = build_max
 
@@ -211,8 +198,6 @@ class PandaRenderer:
         self.base.camLens.setFar(400.0)
 
         self._city_np = None
-        self._rays_np = None
-        self._cam_pos = None          # only used when smooth > 0
         self._tl_nps = []             # [(static_np, [r_np, y_np, g_np]), ...]
         self._tl_lamp_nps = []        # [[r_np, y_np, g_np], ...] — parallel to city.intersections
         # Vehicle meshes are loaded once per model and *instanced* per vehicle.
@@ -226,21 +211,6 @@ class PandaRenderer:
         self._veh_nps = []
         self._setup_lights()
         self._setup_actors()
-
-        # 2-D overlay minimap (top-right corner, onscreen only).
-        self._mm_np = None
-        self._mm_city_np = None
-        self._mm_city_tex = None
-        self._mm_car_np = None
-        self._mm_wpt_nps = []
-        self._mm_extent = (1.0, 1.0)
-        if self.show_minimap:
-            self._setup_minimap_frame()
-
-        # Front/left/right camera picture-in-picture feeds (corner thumbnails).
-        self._pip = []
-        if self.show_cameras:
-            self._setup_pip_cameras()
 
         self._tex = None
         if offscreen:
@@ -331,239 +301,6 @@ class PandaRenderer:
             post.setLightOff()          # emissive-looking, reads as a beacon
             post.hide()
             self.target_nps.append(post)
-
-    # ------------------------------------------------------------------
-    # Minimap (2D top-down overlay)
-    # ------------------------------------------------------------------
-
-    # Minimap bounds in render2d coordinates (-1..1 on a square window).
-    _MM_X0, _MM_X1 = 0.54, 0.98
-    _MM_Z0, _MM_Z1 = 0.56, 0.98
-
-    def _setup_minimap_frame(self):
-        """Create the fixed skeleton: background, city card, waypoint markers."""
-        self._mm_np = self.base.render2d.attachNewNode("minimap")
-
-        pad = 0.028
-        cm = CardMaker("mm_bg")
-        cm.setFrame(self._MM_X0 - pad, self._MM_X1 + pad,
-                    self._MM_Z0 - pad, self._MM_Z1 + pad)
-        bg = self._mm_np.attachNewNode(cm.generate())
-        bg.setColor(*theme.BG_SOLID)
-
-        # City texture quad (texture data filled on each build_scene).
-        self._mm_city_tex = Texture("mm_city")
-        cm2 = CardMaker("mm_city")
-        cm2.setFrame(self._MM_X0, self._MM_X1, self._MM_Z0, self._MM_Z1)
-        self._mm_city_np = self._mm_np.attachNewNode(cm2.generate())
-        self._mm_city_np.setTexture(self._mm_city_tex)
-
-        # Border drawn on top of the city quad.
-        brd = LineSegs()
-        brd.setColor(*theme.BORDER)
-        brd.setThickness(1.5)
-        brd.moveTo(self._MM_X0, 0, self._MM_Z0)
-        brd.drawTo(self._MM_X1, 0, self._MM_Z0)
-        brd.drawTo(self._MM_X1, 0, self._MM_Z1)
-        brd.drawTo(self._MM_X0, 0, self._MM_Z1)
-        brd.drawTo(self._MM_X0, 0, self._MM_Z0)
-        self._mm_np.attachNewNode(brd.create()).setLightOff()
-
-        # Waypoint squares — repositioned each frame, 8 slots for any task size.
-        #
-        # The explicit sort is not cosmetic tidiness. Two waypoints in one route can
-        # be metres apart (non-consecutive pairs come within 0.9 m; only *consecutive*
-        # hops are guaranteed ≥40 m), and then their cards coincide on the minimap.
-        # Coplanar siblings with equal sort draw in an order Panda does not promise to
-        # keep stable, so the current target rendered green in one process and was
-        # covered by a later yellow card in the next — the same seed and step giving
-        # two different images. Slot 0 is the current target, so it gets the highest
-        # sort and is drawn last: the square you are steering towards is never hidden.
-        sq = 0.015
-        for i in range(8):
-            cm3 = CardMaker("mm_wpt")
-            cm3.setFrame(-sq, sq, -sq, sq)
-            wpt = self._mm_np.attachNewNode(cm3.generate())
-            wpt.setLightOff()
-            wpt.setBin("fixed", 8 - i)
-            wpt.hide()
-            self._mm_wpt_nps.append(wpt)
-
-    def _build_minimap_texture(self, city):
-        """Upload a fresh top-down city image to the minimap texture card."""
-        S = 2   # pixels per tile — enough to see street grid without blurring
-        h, w = city.height * S, city.width * S
-        arr = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # Expand the grid (each tile → S×S pixels) with np.kron — fast, one op.
-        expanded = np.kron(city.grid, np.ones((S, S), dtype=city.grid.dtype))
-        arr[expanded == 0] = (38, 42, 46)    # road — dark blue-grey
-        arr[expanded == 1] = (82, 78, 74)    # building — warm grey
-
-        # Panda reads RAM images bottom-up; flip rows so row 0 (top of map)
-        # appears at the top of the minimap quad.
-        self._mm_city_tex.setup2dTexture(w, h, Texture.T_unsigned_byte,
-                                         Texture.F_rgb8)
-        self._mm_city_tex.setRamImage(arr[::-1].tobytes())
-        self._mm_city_tex.setMagfilter(Texture.FTNearest)
-        self._mm_city_tex.setMinfilter(Texture.FTNearest)
-        self._mm_extent = city.extent          # (W*ts, H*ts)
-
-    def _world_to_mm(self, wx, wy):
-        """World (x, y) → render2d minimap (rx, rz).
-
-        World +X maps to minimap right (+rx); world +Y maps to minimap down
-        (-rz) because the world's +Y axis points down the screen and render2d's
-        +Z points up.
-        """
-        ex, ey = self._mm_extent
-        rx = self._MM_X0 + (wx / ex) * (self._MM_X1 - self._MM_X0)
-        rz = self._MM_Z1 - (wy / ey) * (self._MM_Z1 - self._MM_Z0)
-        return float(rx), float(rz)
-
-    def _update_minimap(self, env):
-        """Rebuild the car arrow + waypoint markers each frame."""
-        if self._mm_car_np is not None:
-            self._mm_car_np.removeNode()
-            self._mm_car_np = None
-
-        car = env.car
-        cx, cz = self._world_to_mm(car.x, car.y)
-
-        # Forward and left unit vectors in minimap/render2d space.
-        # heading 0 = world +X (right on minimap), increasing CW.
-        # World +Y points DOWN, so it maps to minimap -Z.
-        fwd_x = np.cos(car.heading)
-        fwd_z = -np.sin(car.heading)
-        lft_x, lft_z = -fwd_z, fwd_x      # CCW 90° of forward
-
-        sz = 0.020
-        segs = LineSegs()
-
-        # Car as a filled triangle: tip forward, base behind.
-        tip_x = cx + fwd_x * sz
-        tip_z = cz + fwd_z * sz
-        bl_x = cx - fwd_x * sz * 0.6 + lft_x * sz * 0.6
-        bl_z = cz - fwd_z * sz * 0.6 + lft_z * sz * 0.6
-        br_x = cx - fwd_x * sz * 0.6 - lft_x * sz * 0.6
-        br_z = cz - fwd_z * sz * 0.6 - lft_z * sz * 0.6
-
-        segs.setThickness(2.5)
-        segs.setColor(*theme.ACCENT)
-        segs.moveTo(bl_x, 0, bl_z)
-        segs.drawTo(tip_x, 0, tip_z)
-        segs.drawTo(br_x, 0, br_z)
-        segs.drawTo(bl_x, 0, bl_z)
-
-        self._mm_car_np = self._mm_np.attachNewNode(segs.create())
-        self._mm_car_np.setLightOff()
-
-        # Waypoint squares — just reposition, colour, and show/hide.
-        pending = list(env.targets[env.target_idx:])
-        for i, wpt_np in enumerate(self._mm_wpt_nps):
-            if i < len(pending):
-                tx, ty = pending[i]
-                mx, mz = self._world_to_mm(tx, ty)
-                wpt_np.setPos(mx, 0, mz)
-                wpt_np.setColor(*(theme.GOOD if i == 0 else theme.WARN))
-                wpt_np.show()
-            else:
-                wpt_np.hide()
-
-    # ------------------------------------------------------------------
-    # Camera picture-in-picture feeds (front / left / right)
-    # ------------------------------------------------------------------
-
-    # Per view: (name, card frame in render2d NDC (x0,x1,z0,z1), buffer pixel
-    # size (w,h), vertical FOV, mount forward-offset (m), mount lateral offset
-    # (m, signed relative bearing in degrees, see `_panda_dir`), mount height
-    # (m), look relative bearing (degrees), look distance (m), look height (m).
-    #
-    # Mount/look directions are expressed as a bearing *relative to the car's
-    # heading* rather than raw Panda vectors, because `_panda_dir` already
-    # encodes the physics->Panda Y-mirror once, correctly, in one place -- the
-    # same derivation `_place_camera` relies on for the chase cam (panda
-    # forward = (cos h, -sin h)). Left/right use +/-90 deg here because, in this
-    # left-handed physics frame (x=east, y=south) mirrored into Panda's
-    # right-handed (east, north, up), true driver-left is heading-90 deg and
-    # driver-right is heading+90 deg -- verified against the h=0 (facing east)
-    # case, where left must be north (+Panda-y).
-    _PIP_SPECS = (
-        # name,    x0,    x1,    z0,    z1,     w,   h,  fov, fwd, lat_deg, lat, ht,   look_deg, look_d, look_z
-        ("front", -0.20,  0.20, -0.98, -0.68,  220, 172, 68.0, 1.8,     0.0, 0.0, 1.25,      0.0,  16.0, 0.7),
-        ("left",  -0.98, -0.58, -0.98, -0.74,  220, 143, 82.0, 0.6,   -90.0, 0.95, 0.90,   -60.0,   9.0, 0.2),
-        ("right",  0.58,  0.98, -0.98, -0.74,  220, 143, 82.0, 0.6,    90.0, 0.95, 0.90,    60.0,   9.0, 0.2),
-    )
-
-    @staticmethod
-    def _panda_dir(heading, rel_deg):
-        """Unit direction in Panda's (x, y) ground plane for a bearing that is
-        `rel_deg` degrees from the car's heading, physics convention."""
-        a = heading + np.radians(rel_deg)
-        return np.cos(a), -np.sin(a)
-
-    def _setup_pip_cameras(self):
-        """Build one offscreen render-to-texture buffer + camera per PiP view,
-        displayed as a bordered card under render2d -- the same texture-card
-        idiom the minimap already uses (`_setup_minimap_frame`), just fed by a
-        live camera instead of a raster upload."""
-        for spec in self._PIP_SPECS:
-            name, x0, x1, z0, z1, w, h, fov = spec[:8]
-            buffer = self.base.win.makeTextureBuffer(f"pip_{name}", w, h)
-            buffer.setSort(-100)          # render before the main window composites
-            buffer.setClearColorActive(True)
-            buffer.setClearColor(Vec4(*SKY, 1.0))
-
-            lens = PerspectiveLens()
-            lens.setFov(fov)
-            lens.setNear(0.3)
-            lens.setFar(400.0)
-            cam_node = Camera(f"pip_cam_{name}")
-            cam_node.setLens(lens)
-            cam_np = self.base.render.attachNewNode(cam_node)
-
-            dr = buffer.makeDisplayRegion()
-            dr.setCamera(cam_np)
-
-            tex = buffer.getTexture()
-            cm = CardMaker(f"pip_{name}_card")
-            cm.setFrame(x0, x1, z0, z1)
-            card_np = self.base.render2d.attachNewNode(cm.generate())
-            card_np.setTexture(tex)
-
-            _, border_np = theme.panel_card(
-                self.base.render2d, x0, x1, z0, z1,
-                bg_color=(0, 0, 0, 0), border_color=theme.BORDER, name=f"pip_{name}")
-
-            label_np = OnscreenText(
-                text=name.upper(), parent=self.base.render2d,
-                pos=((x0 + x1) / 2.0, z1 + 0.018), scale=0.028,
-                fg=theme.TEXT, shadow=(0, 0, 0, 0.7), align=TextNode.ACenter,
-                mayChange=False)
-
-            self._pip.append({
-                "spec": spec, "cam_np": cam_np, "card_np": card_np,
-                "border_np": border_np, "label_np": label_np, "buffer": buffer,
-            })
-
-    def _place_pip_cameras(self, env):
-        car = env.car
-        heading = float(car.heading)
-        cx, cy = car.x, -car.y  # car centre in Panda's Y-mirrored world
-
-        for pip in self._pip:
-            _, _, _, _, _, _, _, _, fwd, lat_deg, lat, ht, look_deg, look_d, look_z = pip["spec"]
-            fdx, fdy = self._panda_dir(heading, 0.0)
-            ldx, ldy = self._panda_dir(heading, lat_deg)
-            mx = cx + fdx * fwd + ldx * lat
-            my = cy + fdy * fwd + ldy * lat
-
-            gdx, gdy = self._panda_dir(heading, look_deg)
-            tx = mx + gdx * look_d
-            ty = my + gdy * look_d
-
-            pip["cam_np"].setPos(mx, my, ht)
-            pip["cam_np"].lookAt(tx, ty, look_z)
 
     # ------------------------------------------------------------------
     # Traffic lights
@@ -692,8 +429,8 @@ class PandaRenderer:
             self._tl_lamp_nps.append(heads)
 
     # Bright / dim colours: index 0 = red, 1 = yellow, 2 = green
-    _TL_ON  = theme.TL_ON
-    _TL_OFF = theme.TL_OFF
+    _TL_ON  = ((1.00, 0.06, 0.04, 1), (1.00, 0.88, 0.04, 1), (0.10, 1.00, 0.12, 1))
+    _TL_OFF = ((0.20, 0.03, 0.03, 1), (0.20, 0.16, 0.03, 1), (0.03, 0.20, 0.03, 1))
     _TL_ORDER = ('red', 'yellow', 'green')
 
     def _update_traffic_lights(self, env):
@@ -974,14 +711,10 @@ class PandaRenderer:
         city_verts[2::3] = tmp
         self._city_np = _mesh_to_node("city", city_verts)
         self._city_np.reparentTo(self.base.render)
-        self._cam_pos = None
 
         self._setup_traffic_lights(city)
         self._setup_traffic(traffic)
         self._setup_street(street)
-
-        if self.show_minimap and self._mm_city_tex is not None:
-            self._build_minimap_texture(city)
 
     # ------------------------------------------------------------------
     def _place_camera(self, env):
@@ -989,13 +722,11 @@ class PandaRenderer:
         fx, fy = np.cos(car.heading), np.sin(car.heading)
         # City/car/beacons all live in Panda's Y-mirrored world (-physics_y).
         # Camera behind car: car_panda − panda_fwd·dist, where panda_fwd=(cos h, −sin h).
-        want = Vec3(car.x - fx * self.cam_dist,
-                    -car.y + fy * self.cam_dist,
-                    self.cam_height)
-        if self.smooth > 0.0 and self._cam_pos is not None:
-            want = self._cam_pos * self.smooth + want * (1.0 - self.smooth)
-        self._cam_pos = want
-        self.base.camera.setPos(want)
+        # Stateless -- capture() must be a pure function of car pose, so there is
+        # no smoothing here (see the module docstring).
+        self.base.camera.setPos(car.x - fx * self.cam_dist,
+                                -car.y + fy * self.cam_dist,
+                                self.cam_height)
         self.base.camera.lookAt(car.x + fx * self.look_ahead,
                                 -car.y - fy * self.look_ahead, 1.2)
 
@@ -1016,68 +747,19 @@ class PandaRenderer:
             else:
                 np_.hide()
 
-    def _draw_rays(self, env):
-        """Per-direction proximity ring in the 3D scene.
-
-        Each segment is coloured by the LIDAR distance in that direction:
-        green = clear, red = obstacle close.  Always clears first so a stale
-        ring never stays frozen when the overlay is switched off.
-        """
-        if self._rays_np is not None:
-            self._rays_np.removeNode()
-            self._rays_np = None
-        lidar = getattr(env, "lidar", None)
-        if not self.show_rays or lidar is None:
-            return
-
-        dists = lidar.last_distances        # (n_beams,) raw metres
-        n_beams = len(dists)
-        max_r = float(lidar.max_range)
-        heading = float(env.car.heading)
-        # Ring is drawn in Panda's Y-mirrored world; car sits at (x, -y).
-        cx, cy = env.car.x, -env.car.y
-
-        segs = LineSegs()
-        segs.setThickness(3.0)
-        radius = 3.0   # metres, just outside the car body
-
-        # Ring angle `a` is in Panda space.  Convert to physics angle (-a) to
-        # look up the right LIDAR beam (beam k at physics heading+π+2πk/n).
-        N = 64
-        for i in range(N + 1):
-            a = 2.0 * np.pi * i / N
-            rel = (-a - heading - np.pi) % (2.0 * np.pi)
-            k = int(round(rel * n_beams / (2.0 * np.pi))) % n_beams
-            t = float(np.clip(dists[k] / max_r, 0.0, 1.0))
-            segs.setColor(*theme.lerp_color(theme.RANGE_NEAR, theme.RANGE_FAR, t))
-            px = cx + np.cos(a) * radius
-            py = cy + np.sin(a) * radius
-            if i == 0:
-                segs.moveTo(px, py, 0.5)
-            else:
-                segs.drawTo(px, py, 0.5)
-
-        self._rays_np = self.base.render.attachNewNode(segs.create())
-        self._rays_np.setLightOff()
-
     def sync(self, env):
         """Point the camera and place the actors for the current env state.
 
-        Split out from `capture` so an interactive window can let Panda drive its
-        own render loop instead of us calling renderFrame by hand.
+        Split out from `capture` so a caller can drive the scene without
+        forcing a render every call.
         """
         if self._city_np is None:
             self.build_scene(env.city, getattr(env, "traffic", None), getattr(env, "street", None))
         self._place_camera(env)
         self._place_actors(env)
-        self._draw_rays(env)
         self._update_traffic_lights(env)
         self._update_traffic(env)
         self._update_pedestrians(env)
-        if self.show_minimap:
-            self._update_minimap(env)
-        if self.show_cameras:
-            self._place_pip_cameras(env)
 
     def capture(self, env, size=None):
         """Render one frame and return it as an (H, W, 3) uint8 array."""
@@ -1106,9 +788,6 @@ class PandaRenderer:
         if self._city_np is not None:
             self._city_np.removeNode()
             self._city_np = None
-        if self._rays_np is not None:
-            self._rays_np.removeNode()
-            self._rays_np = None
         for static_np, lamp_nps in self._tl_nps:
             static_np.removeNode()
             for ln in lamp_nps:
@@ -1126,15 +805,3 @@ class PandaRenderer:
             self._ped_root.removeNode()
             self._ped_root = None
         self._ped_nps = []
-        if self._mm_np is not None:
-            self._mm_np.removeNode()
-            self._mm_np = None
-            self._mm_car_np = None
-        for pip in self._pip:
-            pip["cam_np"].removeNode()
-            pip["card_np"].removeNode()
-            if pip["border_np"] is not None:
-                pip["border_np"].removeNode()
-            pip["label_np"].destroy()
-            self.base.graphicsEngine.removeWindow(pip["buffer"])
-        self._pip = []

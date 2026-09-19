@@ -81,82 +81,25 @@ assert diff > 0.5, "frames are not changing as the car moves"
 
 print()
 print("=" * 62)
-print("3. LIDAR OVERLAY / sync() PATH")
+print("3. sync() PATH (camera + actors, no capture)")
 print("=" * 62)
-# This is what `main.py demo` uses: sync() places the camera and actors without
-# capturing, and rebuilds the ray overlay each frame. Exercised here because the
-# interactive window cannot be asserted on in CI.
-overlay = PandaRenderer(offscreen=True, size=SIZE, show_rays=True)
+# sync() places the camera and actors without capturing -- exercised on its own
+# because a caller that wants to inspect state between frames (e.g. the browser
+# viewer driving PandaRenderer purely for its image observation) uses it that way.
+overlay = PandaRenderer(offscreen=True, size=SIZE)
 env_o = CarNavEnv(config=EnvConfig(), city_config=CITY, obs_type="vector",
                   seed=8, renderer=overlay, image_size=SIZE)
 o, _ = env_o.reset(seed=8)
-plain = renderer.capture(env_o).astype(np.int16)
 for k in range(30):
     env_o.step(np.array([1.0, -1.0, 0.1], dtype=np.float32))
     overlay.sync(env_o)                      # must not leak nodes or raise
-with_rays = overlay.capture(env_o).astype(np.int16)
+overlay.capture(env_o)
 print(f"sync() over 30 steps        : OK (no leak, no raise)")
-
-# The overlay must actually change the pixels, or show_rays is silently a no-op.
-overlay.show_rays = False
-overlay.sync(env_o)
-without = overlay.capture(env_o).astype(np.int16)
-overlay.show_rays = True
-overlay.sync(env_o)
-again = overlay.capture(env_o).astype(np.int16)
-delta = np.abs(again - without).mean()
-print(f"rays change the frame by    : {delta:.2f} mean abs pixel diff")
-assert delta > 0.2, "show_rays=True is not drawing anything"
 overlay.close()
 
 print()
 print("=" * 62)
-print("4a. CAMERA PICTURE-IN-PICTURE (front/left/right)")
-print("=" * 62)
-# Same leak/no-op check as show_rays in section 3, for the three PiP buffers.
-pip_r = PandaRenderer(offscreen=True, size=SIZE, show_cameras=True)
-env_p = CarNavEnv(config=EnvConfig(), city_config=CITY, obs_type="vector",
-                  seed=9, renderer=pip_r, image_size=SIZE)
-o, _ = env_p.reset(seed=9)
-assert len(pip_r._pip) == 3, "expected 3 PiP camera rigs (front/left/right)"
-for k in range(20):
-    env_p.step(np.array([1.0, -1.0, 0.15], dtype=np.float32))
-    pip_r.sync(env_p)                        # must not leak nodes or raise
-print("sync() over 20 steps with show_cameras=True : OK (no leak, no raise)")
-
-with_pip = pip_r.capture(env_p).astype(np.int16)
-# Unlike show_rays (which is rebuilt from scratch every sync() call), the PiP
-# cards are built once in __init__ and only *positioned* on each sync(); the
-# flag is a construction-time switch, not a per-frame toggle. So the honest
-# "without" comparison is hiding the already-built cards, not flipping the
-# flag and re-syncing (which would leave the last-rendered cards in place and
-# make this comparison a false negative).
-for pip in pip_r._pip:
-    pip["card_np"].hide()
-    if pip["border_np"] is not None:
-        pip["border_np"].hide()
-    pip["label_np"].hide()
-without_pip = pip_r.capture(env_p).astype(np.int16)
-for pip in pip_r._pip:
-    pip["card_np"].show()
-    if pip["border_np"] is not None:
-        pip["border_np"].show()
-    pip["label_np"].show()
-delta_pip = np.abs(with_pip - without_pip).mean()
-print(f"cameras change the frame by : {delta_pip:.2f} mean abs pixel diff")
-assert delta_pip > 0.2, "the PiP cards are not drawing anything onto the main capture"
-pip_r.close()
-
-# Default (offscreen=True, unset) must stay off, so training images never see it.
-default_r = PandaRenderer(offscreen=True, size=SIZE)
-assert default_r.show_cameras is False and default_r._pip == [], (
-    "show_cameras must default off for offscreen renderers")
-default_r.close()
-print("offscreen default : show_cameras=False, no PiP nodes created : OK")
-
-print()
-print("=" * 62)
-print("4b. RADAR (auxiliary sensor, not in the observation vector)")
+print("4. RADAR (auxiliary sensor, not in the observation vector)")
 print("=" * 62)
 env_r = CarNavEnv(config=EnvConfig(), city_config=CITY, obs_type="vector", seed=11)
 obs_r, _ = env_r.reset(seed=11)
@@ -181,7 +124,7 @@ print("reward_components sum to the step reward, obs_slices untouched : OK")
 
 print()
 print("=" * 62)
-print("4. RENDER COST")
+print("5. RENDER COST")
 print("=" * 62)
 env_v = CarNavEnv(config=EnvConfig(), city_config=CITY, obs_type="vector", seed=5)
 env_b = make_env("both", seed=5)

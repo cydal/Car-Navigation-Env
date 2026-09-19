@@ -2,19 +2,19 @@
 Entry point for the 3D car navigation environment.
 
     python main.py spec          # print the observation/action contract
-    python main.py demo          # live window, scripted driver, LIDAR overlay
-    python main.py demo --keys   # drive it yourself with the arrow keys
+    python main.py serve         # live browser viewer at http://localhost:8765
     python main.py shots         # save a grid of agent-view frames to a PNG
     python main.py bench         # throughput, vector vs image
-    python main.py serve         # live browser viewer at http://localhost:8765
 
-`demo` is the one to reach for when something looks wrong: seeing the LIDAR fan
-against the geometry it is measuring explains observation bugs far faster than
-reading numbers does.
+`serve` is the one to reach for when something looks wrong: seeing the LIDAR fan
+and camera detections against the geometry they are measuring explains
+observation bugs far faster than reading numbers does. There is no windowed
+Panda3D viewer any more -- `render/panda_renderer.py` only ever produces the
+64x64 image observation now; `serve`'s browser viewer is the one human-facing
+view, and it works against a headless training box just as well as a laptop.
 """
 
 import argparse
-import sys
 import time
 
 import numpy as np
@@ -148,57 +148,6 @@ def cmd_shots(args):
           f"{args.image_size}px per frame, scaled {args.scale}x)")
 
 
-def cmd_demo(args):
-    from render.panda_renderer import PandaRenderer
-    from render.hud import Hud
-    from agents import ManualAgent
-
-    renderer = PandaRenderer(offscreen=False, size=args.window, show_rays=not args.no_rays,
-                             show_cameras=not args.no_cameras, smooth=args.smooth)
-    env = build_env(args, "vector", renderer=renderer)
-    driver = make_driver(env, args.agent)
-    manual_agent = ManualAgent()
-    base = renderer.base
-
-    state = {"obs": None, "info": {}, "paused": False, "manual": args.keys}
-    state["obs"], state["info"] = env.reset(seed=args.seed)
-    driver.reset()
-
-    hud = Hud(base)
-
-    for k in ("arrow_up", "arrow_down", "arrow_left", "arrow_right"):
-        key = {"arrow_up": "up", "arrow_down": "down",
-              "arrow_left": "left", "arrow_right": "right"}[k]
-        base.accept(k, lambda k=key: manual_agent.set_keys(**{k: True}))
-        base.accept(k + "-up", lambda k=key: manual_agent.set_keys(**{k: False}))
-    base.accept("escape", sys.exit)
-    base.accept("r", lambda: (env.reset(), driver.reset()))
-    base.accept("space", lambda: state.__setitem__("paused", not state["paused"]))
-    base.accept("m", lambda: state.__setitem__("manual", not state["manual"]))
-
-    def update(task):
-        if not state["paused"]:
-            active = manual_agent if state["manual"] else driver
-            act = active.act(state["obs"], state["info"])
-            state["obs"], _, te, tr, state["info"] = env.step(act)
-            renderer.sync(env)
-            if te or tr:
-                print(f"episode ended: {state['info']['reason']:<8} "
-                      f"reward {state['info']['episode_reward']:8.1f}  "
-                      f"waypoints {state['info']['targets_reached']}/{env.cfg.n_targets}")
-                state["obs"], state["info"] = env.reset()
-                driver.reset()
-        hud.update(
-            env, state["info"],
-            mode_label="manual" if state["manual"] else "scripted",
-            controls_text="space=pause  m=mode  r=reset  esc=quit")
-        return task.again
-
-    print("demo running -- arrows drive (press m), space pauses, r resets, esc quits")
-    base.taskMgr.doMethodLater(env.cfg.dt, update, "sim")
-    base.run()
-
-
 def cmd_serve(args):
     from serve.server import main as serve_main
     serve_main(host=args.host, port=args.port, seed=args.seed, map_size=args.map,
@@ -211,7 +160,7 @@ def cmd_serve(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["spec", "demo", "shots", "bench", "serve"])
+    ap.add_argument("cmd", choices=["spec", "shots", "bench", "serve"])
     ap.add_argument("--host", default="127.0.0.1",
                     help="serve: bind address; 0.0.0.0 to reach it from another machine")
     ap.add_argument("--port", type=int, default=8765, help="serve: port")
@@ -224,7 +173,7 @@ def main():
     ap.add_argument("--signs", action="store_true",
                     help="30/50 km/h zones and signs (adds a 3-wide observation block)")
     ap.add_argument("--agent", default="scripted",
-                    help="demo/shots/serve: 'scripted', 'random', 'manual', or a path to "
+                    help="shots/serve: 'scripted', 'random', 'manual', or a path to "
                          "a custom agent's JSON config (see agents/loader.py)")
     ap.add_argument("--rate", type=float, default=1.0,
                     help="serve: simulation speed relative to real time")
@@ -232,15 +181,9 @@ def main():
     ap.add_argument("--map", type=int, default=48, help="city size in tiles")
     ap.add_argument("--targets", type=int, default=3)
     ap.add_argument("--beams", type=int, default=32)
-    ap.add_argument("--window", type=int, default=900, help="demo window size")
     ap.add_argument("--image-size", type=int, default=64)
-    ap.add_argument("--smooth", type=float, default=0.0,
-                    help="camera smoothing for demo only; must stay 0 for training")
-    ap.add_argument("--no-rays", action="store_true", help="hide the LIDAR overlay")
-    ap.add_argument("--no-cameras", action="store_true",
-                    help="hide the front/left/right camera picture-in-picture feeds")
     ap.add_argument("--keys", action="store_true",
-                    help="demo: start in manual driving mode (arrow keys)")
+                    help="serve: start in manual driving mode (arrow keys)")
     ap.add_argument("--every", type=int, default=70, help="shots: steps between frames")
     ap.add_argument("--scale", type=int, default=3, help="shots: upscale factor")
     ap.add_argument("--out", default="agent_view.png")

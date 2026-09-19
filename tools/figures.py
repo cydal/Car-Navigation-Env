@@ -1,6 +1,6 @@
-"""Regenerate the README figures.
+"""Regenerate the README figures that don't need the browser viewer.
 
-    python tools/figures.py            # all of them, into docs/
+    python tools/figures.py            # both of them, into docs/
     python tools/figures.py --only task
 
 Frames are chosen by **content predicates read from the observation vector**, not
@@ -12,9 +12,12 @@ producing a figure of the thing it claims to show. The predicates use
 is what the agent sees" is literally true, and a layout change breaks the
 generator rather than silently mislabelling a picture.
 
-One Panda3D `ShowBase` per process, and its framebuffer size is fixed when it is
-built, so the 960x540 scene shots and the 64x64 agent-view grid cannot be made in
-the same process. This script re-invokes itself for the second size.
+This script only covers `docs/task.png` (pure PIL, no renderer) and
+`docs/agent_view.png` (the raw 64x64 training image observation, no overlay).
+The other README screenshots -- the browser viewer's chase/aerial views -- come
+from `tools/viewer_shot.py` against a running `main.py serve` instead, since
+that viewer is a separate process talking over a websocket, not something this
+script's single Panda3D `ShowBase` can drive.
 """
 
 import argparse
@@ -32,7 +35,6 @@ from baselines.scripted import GapFollower
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS = os.path.join(ROOT, "docs")
-WIDE = (960, 540)
 SEEDS = range(5000, 5060)
 
 # Metres per unit in the normalised observation, per block. These are the env's
@@ -127,59 +129,6 @@ def score_traffic(obs, sl, info):
         return -1.0
     # Count dominates, closeness breaks ties: two cars in frame beats one closer one.
     return near.sum() * 100.0 + (35.0 - dist[near].min())
-
-
-def best_frame(env, renderer, scorer, seeds):
-    """Drive the scripted baseline and keep the single highest-scoring frame.
-
-    The renderer is passed in rather than read off the env: the env holds it as a
-    private `_renderer` precisely because the simulation does not depend on it,
-    and a docs tool should not be the thing that makes that private name load-bearing.
-
-    Returns (image_or_None, record). The image is captured lazily -- only when a
-    frame beats the incumbent -- because a 960x540 grab costs far more than a step
-    and the overwhelming majority of steps are not interesting.
-    """
-    sl = env.obs_slices
-    drv = GapFollower.for_env(env)
-    best, best_img, best_rec = -1.0, None, None
-    for seed in seeds:
-        obs, info = env.reset(seed=seed)
-        drv.reset()
-        while True:
-            obs, _, te, tr_, info = env.step(drv.act(obs))
-            s = scorer(obs, sl, info)
-            if s > best:
-                best = s
-                best_rec = dict(seed=seed, step=info["step"], score=round(float(s), 2),
-                                speed=round(info["speed"], 1))
-                renderer.sync(env)
-                best_img = renderer.capture(env).copy()
-            if te or tr_:
-                break
-    return best_img, best_rec
-
-
-# ----------------------------------------------------------------------
-# Scene shots (960x540, one ShowBase)
-# ----------------------------------------------------------------------
-def scene_shots():
-    from render.panda_renderer import PandaRenderer
-
-    # Overlays are forced on: they default off for offscreen buffers so that a
-    # debug ring can never leak into an image *observation*, but these are
-    # documentation, and the ring is the clearest picture of what LIDAR gives.
-    r = PandaRenderer(offscreen=True, size=WIDE, show_rays=True, show_minimap=True)
-    env = carnav.make(width=48, height=48, renderer=r, seed=0)
-
-    for name, scorer in (("hero", score_hero), ("signal", score_signal),
-                         ("traffic", score_traffic)):
-        img, rec = best_frame(env, r, scorer, SEEDS)
-        if img is None:
-            print(f"  {name}: no frame matched the predicate -- skipped")
-            continue
-        Image.fromarray(img).save(os.path.join(DOCS, f"{name}.png"))
-        print(f"  docs/{name}.png  {rec}")
 
 
 # ----------------------------------------------------------------------
@@ -389,7 +338,7 @@ def task_diagram(px_per_tile=15):
 
 
 # ----------------------------------------------------------------------
-FIGURES = {"scenes": scene_shots, "agent": agent_view, "task": task_diagram}
+FIGURES = {"agent": agent_view, "task": task_diagram}
 
 
 def main():
@@ -404,9 +353,8 @@ def main():
 
     print("task diagram (no renderer)")
     task_diagram()
-    print("scene shots (960x540 ShowBase)")
-    scene_shots()
-    # A fresh process: this ShowBase is a singleton with a fixed buffer size.
+    # Re-invoked as a subprocess so agent_view() gets a fresh ShowBase: Panda3D
+    # allows only one per process, and its framebuffer size is fixed once built.
     print("agent view (64x64 ShowBase, separate process)")
     sub = subprocess.run([sys.executable, os.path.abspath(__file__), "--only", "agent"],
                          cwd=ROOT, capture_output=True, text=True)
