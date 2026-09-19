@@ -217,12 +217,17 @@ headless training box: start it there with `--host 0.0.0.0` (or tunnel with
 rendering on its own GPU. Needs `pip install websockets` (the `viewer` extra).
 
 The page shows a chase / aerial / driver camera, front / left / right / rear
-camera feeds, the LIDAR fan and a per-sector radar readout, the scripted driver's
-intent and the speed cap that binds it, the reward and its components, a minimap
-and a 60 s decision timeline. Space pauses, `.` single-steps while paused, R
-restarts the same seed, N draws a new map, M toggles manual driving (arrow keys),
-V cycles the view, O toggles the sensor overlays; traffic density and sim rate are
-in the top bar. `tools/viewer_shot.py` screenshots the running page headlessly
+camera feeds, the LIDAR fan and a per-sector radar readout, the reward and its
+components, a minimap and a 60 s history of which speed cap most recently bound
+the scripted driver. World picks a terrain preset -- `city` (dense blocks),
+`suburbs` (houses with gardens), `rural` (open fields, sparse barns/silos, long
+straight roads) or `industrial` (warehouses) -- all built from the same
+procedural road network, just styled and spaced differently; `?world=rural` in
+the URL opens directly into one. Space pauses, `.` single-steps while paused, R
+restarts the same seed, N draws a new map, M toggles manual driving (up/down
+arrows drive forward/reverse, left/right steer), V cycles the view, O toggles
+the sensor overlays; world, traffic density and sim rate are in the top bar.
+`tools/viewer_shot.py` screenshots the running page headlessly
 (Playwright), for checking the render from a box with no display.
 
 ### Panda3D window

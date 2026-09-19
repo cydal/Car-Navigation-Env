@@ -206,8 +206,8 @@ def cmd_demo(args):
 def cmd_serve(args):
     from serve.server import main as serve_main
     serve_main(host=args.host, port=args.port, seed=args.seed, map_size=args.map,
-               n_targets=args.targets, traffic=args.traffic, manual=args.keys,
-               rate=args.rate)
+               n_targets=args.targets, traffic=args.traffic, world=args.world,
+               manual=args.keys, rate=args.rate)
 
 
 # ----------------------------------------------------------------------
@@ -220,6 +220,8 @@ def main():
     ap.add_argument("--port", type=int, default=8765, help="serve: port")
     ap.add_argument("--traffic", default="normal", choices=["none", "light", "normal", "dense"],
                     help="serve: traffic preset")
+    ap.add_argument("--world", default="city", choices=["city", "suburbs", "rural", "industrial"],
+                    help="serve: world/terrain preset")
     ap.add_argument("--rate", type=float, default=1.0,
                     help="serve: simulation speed relative to real time")
     ap.add_argument("--seed", type=int, default=0)
