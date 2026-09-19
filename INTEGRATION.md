@@ -146,9 +146,12 @@ With the defaults (`n_beams=32`, `n_lookahead=3`, `n_tl_obs=1`, `n_traffic_obs=4
 | `nav` | `37:46` | 9 | next 3 waypoints × (distance / 150 m clipped to 1, sin, cos of bearing) |
 | `traffic_light` | `46:53` | 7 | nearest signal: distance **to the stop line** / 60 m, sin, cos of bearing, then one-hot red / yellow / green **for this car's approach axis**, then steps until the phase changes / 100 |
 | `traffic` | `53:73` | 20 | nearest 4 **moving** vehicles × (distance / 60 m, sin, cos of bearing, relative velocity x and y in the ego frame / 22) |
+| `pedestrians` | `73:93` | 20 | **opt-in** (`pedestrians=True`): nearest 4 people × the same 5 features as a traffic slot. People are also in the LIDAR scan as 0.3 m circles. |
+| `signs` | `93:96` | 3 | **opt-in** (`speed_signs=True`): active speed limit / 22, next sign ahead's distance / 60 m (1 if none), its limit / 22 (0 if none). The *active* limit is given directly, so no sign memory is needed to stay Markov. |
 
 Blocks a switch removes become **empty slices**, not missing keys, so
-`obs[sl["traffic"]]` is always valid:
+`obs[sl["traffic"]]` is always valid. The two opt-in blocks are appended
+*behind* everything else, so switching them on never moves an existing index:
 
 | config | `vector_dim` | vehicles |
 |---|---|---|
@@ -156,6 +159,9 @@ Blocks a switch removes become **empty slices**, not missing keys, so
 | `traffic_lights=False` | 66 | 26 |
 | `traffic=False` | 53 | 0 |
 | both off | 46 | 0 — the original task |
+| `pedestrians=True` | 93 | 26, plus ~1–3 people at each of 6 zebra crossings |
+| `speed_signs=True` | 76 | 26, plus 30 km/h zones and signs around 6 crossings |
+| both on | 96 | the fullest task |
 
 ### Padding conventions
 
@@ -237,7 +243,9 @@ reward = -time_penalty * action_repeat
        + progress_weight * (dist_to_target_before - dist_to_target_after)
        + target_bonus      per waypoint reached this step
        - red_light_penalty per red-light entry this step
-       - crash_penalty     if this step crashed
+       - crash_penalty     if this step crashed into a building or vehicle
+       - pedestrian_penalty  if this step hit a person            (pedestrians=True only)
+       - speeding_penalty * max(0, speed - limit)  per physics step (speed_signs=True only)
        - time_penalty * action_repeat * steps_remaining   if this step ended as "stuck"
 ```
 
@@ -248,6 +256,8 @@ reward = -time_penalty * action_repeat
 | `target_bonus` | 100.0 | per waypoint |
 | `crash_penalty` | 100.0 | building or vehicle alike; `info["crash_with"]` says which |
 | `red_light_penalty` | 50.0 | on **entry only**, never per step of occupancy |
+| `pedestrian_penalty` | 300.0 | **opt-in**; terminates with `crash_with="pedestrian"`; deliberately larger than a vehicle crash and its own `reward_components` entry, so an agent has a reason to treat a person differently from a parked van |
+| `speeding_penalty` | 0.05 per m/s over, per physics step | **opt-in**; 5 m/s over the limit for 5 s costs 25. The limit is 50 km/h, or 30 within a zone around a crossing |
 
 Reconstructed from `info` alone and checked against the env's own reward to a **max
 residual of 7.1e-15** — over 18,363 steps on every `test_integration` run (51
@@ -416,7 +426,9 @@ Returned by both `reset` and `step`; a fresh dict each time, safe to keep.
 | `dist_to_target` | `float` | metres to the current waypoint |
 | `target_bearing` | `float` | radians, body frame |
 | `x`, `y`, `heading`, `speed`, `steer_angle` | `float` | privileged ground truth, **for logging and diagnostics only** |
-| `reward_components` | `dict \| absent` | `step`-only; `{"time", "crash", "progress", "target_bonus", "red_light"}`, sums exactly to that step's `reward` -- for logging/dashboards, not present on `reset`'s info |
+| `reward_components` | `dict \| absent` | `step`-only; `{"time", "crash", "progress", "target_bonus", "red_light", "pedestrian", "speeding"}`, sums exactly to that step's `reward` -- for logging/dashboards, not present on `reset`'s info |
+| `speed_limit` | `float \| None` | active limit in m/s at the car's position when `speed_signs=True`, else `None` |
+| `pedestrians_on_road` | `int` | people currently on a zebra (0 unless `pedestrians=True`) |
 
 `reward_components` is purely additive bookkeeping: it does not change the
 `reward` scalar, `observation_space`, or any existing `info` key.

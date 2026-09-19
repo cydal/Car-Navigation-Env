@@ -17,6 +17,7 @@ python main.py spec           # observation / action contract
 python main.py demo           # live window, scripted driver, LIDAR overlay
 python main.py demo --keys    # same but drive it yourself (arrow keys + brake)
 python main.py serve          # live browser viewer at http://localhost:8765 (needs websockets)
+python main.py serve --pedestrians --signs   # + zebra crossings with people, 30/50 km/h zones
 python main.py bench          # throughput, vector vs image
 python main.py shots          # save a grid of 64x64 agent-view frames
 python tools/figures.py       # regenerate every figure in this README
@@ -632,6 +633,28 @@ Two lessons from tuning it that apply to reward shaping generally:
 - A proportional gain on heading error commanded near-full lock for a 10°
   correction and oscillated. Pure-pursuit geometry scales the response to how far
   away the aim point is, which is what actually holds a line.
+
+## Pedestrians and speed signs (opt-in)
+
+`EnvConfig(pedestrians=True)` puts zebra crossings on six unsignalised junction
+arms per map, each with one to three people waiting at the kerb. A group steps
+out once the ego approaches within its trigger distance (after a per-person
+delay), crosses at walking pace, then waits on the far kerb and re-arms once
+the ego has gone. Background traffic yields to an occupied crossing; the ego
+has to work that out for itself. People are in the LIDAR scan as small circles
+and in a new nearest-4 observation block with the traffic block's layout;
+hitting one costs `pedestrian_penalty` (300) and ends the episode. Waiting at a
+zebra is exempt from the stuck detector, like waiting at a red.
+
+`EnvConfig(speed_signs=True)` anchors a 30 km/h zone to each crossing (50
+elsewhere), with a 30 sign at the zone entry and a 50 at the exit for each
+direction. The observation carries the *active* limit and the next sign ahead,
+and speeding is charged per step in proportion to the excess. Both flags are
+off by default, so the 73-D contract and the baseline numbers above are
+unchanged; the scripted baseline handles both when they are on (its
+closest-approach conflict test runs on the pedestrian block unchanged) and
+crossed 150 zebras across 20 seeds without hitting anyone. Details and
+observation indices in [INTEGRATION.md](INTEGRATION.md#observation).
 
 ## Agents, replay, and structured sensing
 
