@@ -441,7 +441,7 @@ class Traffic:
         self.heading[:n] = (t0 + (t1 - t0) * frac[:, 0]) % (2.0 * np.pi)
         self._idx = i0
 
-    def step(self, dt, car, lights):
+    def step(self, dt, car, lights, street=None):
         """Advance all moving vehicles one timestep."""
         n = self.n_moving
         if n == 0:
@@ -453,6 +453,8 @@ class Traffic:
         target = np.minimum(target, self._signal_target(lights, geom))
         target = np.minimum(target, self._junction_target(geom, car))
         target = np.minimum(target, self._follow_target(car))
+        if street is not None and street.n_crossings:
+            target = np.minimum(target, self._crossing_target(street))
 
         dv = target - self.speed[:n]
         self.speed[:n] = np.maximum(0.0, self.speed[:n] + np.clip(
@@ -589,6 +591,30 @@ class Traffic:
 
         room = np.maximum(0.0, d - self.STOP_MARGIN)
         return np.where(blocked, np.sqrt(2.0 * self.A_DECEL * room), np.inf)
+
+    def _crossing_target(self, street):
+        """Speed cap from an occupied zebra crossing ahead on the vehicle's corridor.
+
+        Traffic yields to people, the ego does not get that for free -- the
+        same asymmetry as signals, where traffic obeys the light and the ego
+        has to learn to. A vehicle already past the crossing centre is
+        released, so a person stepping out behind it cannot freeze it.
+        """
+        n = self.n_moving
+        occ = street.occupied()
+        if not occ.any():
+            return np.full(n, np.inf)
+        cx, cy = street.cx[occ], street.cy[occ]
+        dx = cx[None, :] - self.x[:n, None]
+        dy = cy[None, :] - self.y[:n, None]
+        c, s = np.cos(self.heading[:n]), np.sin(self.heading[:n])
+        along = dx * c[:, None] + dy * s[:, None]
+        lat = np.abs(-dx * s[:, None] + dy * c[:, None])
+        claims = (along > 0.0) & (along < 45.0) & (lat < street.half)
+        # Rest with the nose a stop margin short of the zebra's near edge.
+        room = np.maximum(0.0, along - 1.5 - self.STOP_MARGIN - self.length[:n, None] / 2.0)
+        v = np.where(claims, np.sqrt(2.0 * self.A_DECEL * room), np.inf)
+        return v.min(axis=1)
 
     def _follow_target(self, car):
         """Speed cap from the nearest thing ahead in the same lane.

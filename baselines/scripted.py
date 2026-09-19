@@ -54,11 +54,19 @@ class GapFollower:
         follow_gap=4.0,
         conflict_pad=1.5,
         conflict_horizon=3.0,
+        n_ped_obs=0,
+        ped_obs_range=60.0,
+        n_sign_obs=0,
+        sign_range=60.0,
     ):
         self.n_beams = n_beams
         self.n_lookahead = n_lookahead
         self.n_tl_obs = n_tl_obs
         self.tl_obs_range = tl_obs_range
+        self.n_ped_obs = n_ped_obs
+        self.ped_obs_range = ped_obs_range
+        self.n_sign_obs = n_sign_obs
+        self.sign_range = sign_range
         self.tl_stop_margin = tl_stop_margin  # metres to stop short of the stop line
         self.n_traffic_obs = n_traffic_obs
         self.traffic_obs_range = traffic_obs_range
@@ -120,7 +128,9 @@ class GapFollower:
                    wheelbase=p.wheelbase,
                    n_tl_obs=c.n_tl_obs, tl_obs_range=c.tl_obs_range,
                    n_traffic_obs=c.n_traffic_obs,
-                   traffic_obs_range=c.traffic_obs_range, **kw)
+                   traffic_obs_range=c.traffic_obs_range,
+                   n_ped_obs=c.n_ped_obs, ped_obs_range=c.ped_obs_range,
+                   n_sign_obs=c.n_sign_obs, sign_range=c.sign_range, **kw)
 
     def reset(self):
         """Clear the steering filter between episodes."""
@@ -141,13 +151,17 @@ class GapFollower:
         nav_end = n + 5 + 3 * self.n_lookahead
         tl_end = nav_end + 7 * self.n_tl_obs
         traf_end = tl_end + 5 * self.n_traffic_obs
-        if traf_end != len(obs):
+        ped_end = traf_end + 5 * self.n_ped_obs
+        sign_end = ped_end + 3 * self.n_sign_obs
+        if sign_end != len(obs):
             raise ValueError(
-                f"observation is {len(obs)}-D but this driver expects {traf_end}-D "
+                f"observation is {len(obs)}-D but this driver expects {sign_end}-D "
                 f"(n_beams={n}, n_lookahead={self.n_lookahead}, "
-                f"n_tl_obs={self.n_tl_obs}, n_traffic_obs={self.n_traffic_obs})")
+                f"n_tl_obs={self.n_tl_obs}, n_traffic_obs={self.n_traffic_obs}, "
+                f"n_ped_obs={self.n_ped_obs}, n_sign_obs={self.n_sign_obs})")
         return (obs[:n], obs[n:n + 5], obs[n + 5:nav_end],
-                obs[nav_end:tl_end], obs[tl_end:traf_end])
+                obs[nav_end:tl_end], obs[tl_end:traf_end],
+                obs[traf_end:ped_end], obs[ped_end:sign_end])
 
     def _red_light_stop_speed(self, tl):
         """Target speed to hold for the nearest signal, or None if it is not ours.
@@ -169,7 +183,7 @@ class GapFollower:
         room = max(0.0, to_line - self.tl_stop_margin)
         return float(np.sqrt(2.0 * self.brake_decel * room))
 
-    def _traffic_conflict_speed(self, traf, speed):
+    def _traffic_conflict_speed(self, traf, speed, rng_m=None, pedestrians=False):
         """Speed cap for the nearest vehicle we are on course to hit, or None.
 
         This is the term the traffic block exists for. LIDAR already reports
@@ -198,18 +212,25 @@ class GapFollower:
         """
         if traf.size < 5:
             return None
+        rng_m = self.traffic_obs_range if rng_m is None else rng_m
         hl, hw = self.car_length / 2.0, self.car_width / 2.0
         best = None
         for i in range(0, traf.size - 4, 5):
             sin_b, cos_b = float(traf[i + 1]), float(traf[i + 2])
             if sin_b == 0.0 and cos_b == 0.0:
                 continue                        # padded empty slot, not a vehicle
-            d = float(traf[i]) * self.traffic_obs_range
+            d = float(traf[i]) * rng_m
             px, py = d * cos_b, d * sin_b       # ego frame: +x forward, +y right
             if px <= 0.0:
                 continue                        # behind us; not ours to avoid
             vx = float(traf[i + 3]) * self.max_speed
             vy = float(traf[i + 4]) * self.max_speed
+            # A person standing still beside our path is a kerb-stander, not a
+            # hazard: treating them as a car-sized obstacle parked the baseline
+            # beside a finished crossing group until the stuck detector fired.
+            # Anyone moving, or standing directly ahead, is still fully honoured.
+            if pedestrians and np.hypot(vx + speed, vy) < 0.3 and abs(py) > hw + 0.5:
+                continue
             vv = vx * vx + vy * vy
             # Time of closest approach, clamped to the horizon we plan over. Zero
             # relative velocity means the gap never changes, so the answer is now.
@@ -248,7 +269,7 @@ class GapFollower:
         return float(clear[idx])
 
     def act(self, obs, info=None):
-        scan, dyn, nav, tl, traf = self.unpack(obs)
+        scan, dyn, nav, tl, traf, ped, signs = self.unpack(obs)
         speed = float(dyn[0]) * self.max_speed
         bearing = float(np.arctan2(nav[1], nav[2]))
 
@@ -340,8 +361,30 @@ class GapFollower:
         if v_traffic is not None:
             target = min(target, v_traffic)
 
+        # Pedestrians share the traffic slot layout, so the same closest-approach
+        # test applies unchanged. Treating a 0.3 m person as car-sized is
+        # conservative in exactly the right direction.
+        v_ped = self._traffic_conflict_speed(ped, speed, self.ped_obs_range, pedestrians=True)
+        if v_ped is not None:
+            target = min(target, v_ped)
+
+        # Posted limit: hold the active one, and be down to a lower one ahead by
+        # the time we reach its sign rather than braking as we pass it.
+        v_limit = None
+        if signs.size >= 3:
+            v_limit = float(signs[0]) * self.max_speed
+            next_d, next_v = float(signs[1]) * self.sign_range, float(signs[2]) * self.max_speed
+            if signs[2] > 0.0 and next_v < v_limit:
+                v_limit = min(v_limit, float(np.sqrt(next_v ** 2 + 2.0 * self.brake_decel * max(0.0, next_d))))
+            target = min(target, v_limit)
+
         err = target - speed
-        if err > 0.25:
+        if target < 0.5:
+            # A genuine halt (red light, queue, person on the zebra). The creep
+            # allowance below would otherwise idle the car forward at ~0.6 m/s
+            # forever -- a target of zero has to mean the brake is on.
+            throttle, brake = 0.0, 1.0
+        elif err > 0.25:
             throttle, brake = min(1.0, err / 2.5), 0.0
         elif err < -0.6:
             throttle, brake = 0.0, min(1.0, -err / 5.0)
@@ -364,6 +407,8 @@ class GapFollower:
             "in_corridor": in_corridor,
             "v_light": v_light,
             "v_traffic": v_traffic,
+            "v_ped": v_ped,
+            "v_limit": v_limit,
         }
 
         # `throttle` here is already the signed [-1, 1] channel the env expects (this
@@ -394,16 +439,18 @@ class GapFollower:
             "turn": self.cruise_speed * (1.0 - 0.45 * abs(float(last["steer"]))),
             "signal": last["v_light"],
             "traffic": last["v_traffic"],
+            "pedestrian": last.get("v_ped"),
+            "limit": last.get("v_limit"),
         }
-        # Signal and traffic are checked first: they're applied after the
-        # creep-floor clip, so when they bind the match against target is
-        # exact. A target below cruise that matches no cap was clipped to
-        # the creep floor by the clearance term.
+        # Signal, traffic, pedestrian and limit are checked first: they're
+        # applied after the creep-floor clip, so when they bind the match
+        # against target is exact. A target below cruise that matches no cap
+        # was clipped to the creep floor by the clearance term.
         intent = "cruise"
         if last["fell_back"]:
             intent = "no_safe_heading"
         else:
-            for name in ("signal", "traffic", "clearance", "turn"):
+            for name in ("pedestrian", "signal", "traffic", "limit", "clearance", "turn"):
                 v = caps[name]
                 if v is not None and v < self.cruise_speed - 1e-3 and abs(float(v) - target) < 1e-3:
                     intent = name

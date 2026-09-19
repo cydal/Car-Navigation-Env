@@ -24,7 +24,8 @@ from env.perception import CAMERAS  # noqa: E402
 from agents import load_agent, RandomAgent, ManualAgent  # noqa: E402
 
 INTENTS = {"cruise", "traffic", "clearance", "turn", "signal", "manual",
-           "no_safe_heading", "starting"}
+           "no_safe_heading", "starting", "pedestrian", "limit"}
+COMPONENTS = {"time", "crash", "progress", "target_bonus", "red_light", "pedestrian", "speeding"}
 
 print("=" * 62)
 print("1. RESET / TICK MESSAGES SERIALISE")
@@ -50,7 +51,7 @@ assert set(t["perception"]["cameras"]) == set(CAMERAS)
 assert set(t["perception"]["blind_spots"]) == {"left", "right"}
 assert t["driver"]["intent"] in INTENTS
 assert t["driver"]["kind"] == "GapFollower" and t["driver"]["manual"] is False
-assert set(t["info"]["reward_components"]) == {"time", "crash", "progress", "target_bonus", "red_light"}
+assert set(t["info"]["reward_components"]) == COMPONENTS
 print(f"reset {len(json.dumps(r)):,} B, tick {len(json.dumps(t)):,} B, intent now '{t['driver']['intent']}' : OK")
 
 print()

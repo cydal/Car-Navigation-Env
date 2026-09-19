@@ -172,7 +172,7 @@ for _ in range(30):
 assert obs_r.shape == (env_r.vector_dim,), "radar must not change vector_dim"
 assert env_r.radar.last_distances.shape == (env_r.cfg.n_radar_sectors,)
 assert set(info_r["reward_components"]) == {
-    "time", "crash", "progress", "target_bonus", "red_light"}
+    "time", "crash", "progress", "target_bonus", "red_light", "pedestrian", "speeding"}
 comp_sum = sum(info_r["reward_components"].values())
 assert abs(comp_sum - last_reward) < 1e-4, (
     f"reward_components ({comp_sum}) must sum to the step reward ({last_reward})")

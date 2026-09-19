@@ -793,7 +793,7 @@ class PandaRenderer:
             np_.setH(-np.degrees(float(traffic.heading[i])))
 
     # ------------------------------------------------------------------
-    def build_scene(self, city, traffic=None):
+    def build_scene(self, city, traffic=None, street=None):
         """(Re)build the city mesh. Called on every reset, so it must be quick."""
         if self._city_np is not None:
             self._city_np.removeNode()
@@ -911,6 +911,7 @@ class PandaRenderer:
 
         self._setup_traffic_lights(city)
         self._setup_traffic(traffic)
+        self._street = street
 
         if self.show_minimap and self._mm_city_tex is not None:
             self._build_minimap_texture(city)

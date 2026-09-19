@@ -21,6 +21,7 @@ from .world import ProceduralCity, CityConfig
 from .car import Car, CarParams
 from .sensors import Lidar, Radar, nav_features, dynamics_features, relative_bearing
 from .perception import Perception
+from .crossings import Street, PED_FEATURES, SIGN_FEATURES
 from .traffic import Traffic, TRAFFIC_FEATURES
 
 try:                                    # gymnasium is optional
@@ -178,6 +179,22 @@ class EnvConfig:
         radar_noise=0.0,
         # --- perception (auxiliary sensor; never enters the observation vector)
         perception=True,
+        # --- pedestrians at zebra crossings (opt-in; appends a 5*n_ped_obs block)
+        pedestrians=False,
+        n_crossings=6,
+        crossing_min_sep=40.0,
+        crossing_offset=2.0,        # metres beyond the junction box edge
+        peds_per_crossing=(1, 3),
+        n_ped_obs=None,             # None = 4 when pedestrians are on, else 0
+        ped_obs_range=60.0,
+        pedestrian_penalty=300.0,
+        # --- speed signs (opt-in; appends a 3-wide block)
+        speed_signs=False,
+        speed_limit_kmh=50.0,
+        zone_limit_kmh=30.0,        # within zone_len of a crossing
+        zone_len=30.0,
+        sign_range=60.0,
+        speeding_penalty=0.05,      # per m/s over the limit, per physics step
     ):
         self.n_targets = n_targets              # waypoints per episode
         self.n_lookahead = n_lookahead          # waypoints exposed in the observation
@@ -224,6 +241,25 @@ class EnvConfig:
         # no observation-block width -- turning it off just stops the
         # renderer/HUD from reading it.
         self.perception = perception
+        # Pedestrians and signs follow the lights/traffic one-switch rule: each
+        # flag adds its people/signs, its penalty and its observation block
+        # together. Both are off by default so the 73-D contract, its tests and
+        # the published baseline numbers are exactly what they were.
+        self.pedestrians = pedestrians
+        self.n_crossings = n_crossings if (pedestrians or speed_signs) else 0
+        self.crossing_min_sep = crossing_min_sep
+        self.crossing_offset = crossing_offset
+        self.peds_per_crossing = tuple(peds_per_crossing)
+        self.n_ped_obs = (4 if pedestrians else 0) if n_ped_obs is None else n_ped_obs
+        self.ped_obs_range = ped_obs_range
+        self.pedestrian_penalty = pedestrian_penalty
+        self.speed_signs = speed_signs
+        self.n_sign_obs = 1 if speed_signs else 0
+        self.speed_limit_kmh = speed_limit_kmh
+        self.zone_limit_kmh = zone_limit_kmh
+        self.zone_len = zone_len
+        self.sign_range = sign_range
+        self.speeding_penalty = speeding_penalty
 
 
 class CarNavEnv(_BaseEnv):
@@ -288,6 +324,7 @@ class CarNavEnv(_BaseEnv):
             rng=self.rng,
         )
         self.perception = Perception()
+        self.street = Street(self.cfg, self.rng)
 
         # --- episode state
         self.targets = []
@@ -307,7 +344,9 @@ class CarNavEnv(_BaseEnv):
         self.action_space = _box(-1.0, 1.0, (3,))
         self.vector_dim = (self.cfg.n_beams + 5 + 3 * self.cfg.n_lookahead
                            + TL_FEATURES * self.cfg.n_tl_obs
-                           + TRAFFIC_FEATURES * self.cfg.n_traffic_obs)
+                           + TRAFFIC_FEATURES * self.cfg.n_traffic_obs
+                           + PED_FEATURES * self.cfg.n_ped_obs
+                           + SIGN_FEATURES * self.cfg.n_sign_obs)
         vec_space = _box(-1.0, 1.0, (self.vector_dim,))
         img_space = _box(0, 255, (image_size, image_size, 3), np.uint8)
         if obs_type == "vector":
@@ -355,7 +394,9 @@ class CarNavEnv(_BaseEnv):
         c = self.cfg
         w = [("lidar", c.n_beams), ("dynamics", 5), ("nav", 3 * c.n_lookahead),
              ("traffic_light", TL_FEATURES * c.n_tl_obs),
-             ("traffic", TRAFFIC_FEATURES * c.n_traffic_obs)]
+             ("traffic", TRAFFIC_FEATURES * c.n_traffic_obs),
+             ("pedestrians", PED_FEATURES * c.n_ped_obs),
+             ("signs", SIGN_FEATURES * c.n_sign_obs)]
         out, i = {}, 0
         for name, n in w:
             out[name] = slice(i, i + n)
@@ -393,12 +434,14 @@ class CarNavEnv(_BaseEnv):
         # subsystem's draws (city, lidar, traffic, ...) exactly as they were --
         # inserting it earlier would silently reshuffle all of them and break
         # every previously-seeded rollout's reproducibility.
-        env_ss, city_ss, lidar_ss, traffic_ss, space_ss, gym_ss, radar_ss = ss.spawn(7)
+        (env_ss, city_ss, lidar_ss, traffic_ss, space_ss, gym_ss, radar_ss,
+         street_ss) = ss.spawn(8)                  # street_ss: trailing, same rule
         self.rng = np.random.default_rng(env_ss)
         self.city.rng = np.random.default_rng(city_ss)
         self.lidar.rng = np.random.default_rng(lidar_ss)
         self.radar.rng = np.random.default_rng(radar_ss)
         self.traffic.rng = np.random.default_rng(traffic_ss)
+        self.street.rng = np.random.default_rng(street_ss)
         space_seed = int(space_ss.generate_state(1, dtype=np.uint32)[0])
         for space in (self.action_space, self.observation_space):
             if hasattr(space, "seed"):
@@ -439,6 +482,7 @@ class CarNavEnv(_BaseEnv):
         # only checks buildings, so a vehicle spawned on the spawn point would put
         # back the unwinnable start that the swept-clearance check removes.
         self.traffic.reset(x, y)
+        self.street.reset(self.city, x, y)
         if self.cfg.radar:
             self.radar.scan(self.traffic, self.car)
         if self.cfg.perception:
@@ -456,7 +500,7 @@ class CarNavEnv(_BaseEnv):
         self.prev_dist = self._dist_to_target()
 
         if self._renderer is not None:
-            self._renderer.build_scene(self.city, self.traffic)
+            self._renderer.build_scene(self.city, self.traffic, self.street)
 
         return self._observe(), self._info()
 
@@ -487,6 +531,8 @@ class CarNavEnv(_BaseEnv):
         comp_progress = 0.0
         comp_target = 0.0
         comp_red_light = 0.0
+        comp_pedestrian = 0.0
+        comp_speeding = 0.0
         terminated = False
         crashed = False
         reached = 0
@@ -498,20 +544,36 @@ class CarNavEnv(_BaseEnv):
             # Stepping it once per env step instead would let a vehicle jump
             # action_repeat * dt * v metres between collision checks and pass
             # clean through the car.
-            self.traffic.step(cfg.dt, self.car, self.traffic_lights)
+            self.traffic.step(cfg.dt, self.car, self.traffic_lights, self.street)
+            self.street.step(cfg.dt, self.car)
             reward -= cfg.time_penalty
             comp_time -= cfg.time_penalty
 
             hit_building = self.city.collides(
                 self.car.x, self.car.y, self.car.heading,
                 self.car.p.length, self.car.p.width)
-            if hit_building or self.traffic.hits(self.car):
-                reward -= cfg.crash_penalty
-                comp_crash -= cfg.crash_penalty
+            hit_ped = self.street.hits(self.car)
+            if hit_building or hit_ped or self.traffic.hits(self.car):
+                # A person is categorically worse than a kerb or a parked van:
+                # its own, larger penalty and its own reward component.
+                if hit_ped:
+                    reward -= cfg.pedestrian_penalty
+                    comp_pedestrian -= cfg.pedestrian_penalty
+                else:
+                    reward -= cfg.crash_penalty
+                    comp_crash -= cfg.crash_penalty
                 terminated = crashed = True
                 self.terminated_reason = "crash"
-                self.crash_with = "building" if hit_building else "vehicle"
+                self.crash_with = ("pedestrian" if hit_ped
+                                   else "building" if hit_building else "vehicle")
                 break
+
+            if cfg.speed_signs:
+                excess = self.car.speed - self.street.limit_at(self.car.x, self.car.y)
+                if excess > 0.0:
+                    fine = cfg.speeding_penalty * excess
+                    reward -= fine
+                    comp_speeding -= fine
 
             dist = self._dist_to_target()
             step_progress = (self.prev_dist - dist) * cfg.progress_weight
@@ -570,7 +632,8 @@ class CarNavEnv(_BaseEnv):
         # here costs nothing but compute.
         if not terminated and cfg.stuck_steps:
             idle = self.car.speed < cfg.stuck_speed
-            held = idle and (self._waiting_at_red() or self._blocked_by_traffic())
+            held = idle and (self._waiting_at_red() or self._blocked_by_traffic()
+                             or self.street.yielding(self.car))
             self.stuck_count = self.stuck_count + 1 if (idle and not held) else 0
             if self.stuck_count >= cfg.stuck_steps:
                 remaining = max(0, cfg.max_episode_steps - self.step_count)
@@ -600,6 +663,8 @@ class CarNavEnv(_BaseEnv):
             "progress": comp_progress,
             "target_bonus": comp_target,
             "red_light": comp_red_light,
+            "pedestrian": comp_pedestrian,
+            "speeding": comp_speeding,
         }
         return self._observe(), float(reward), bool(terminated), bool(truncated), info
 
@@ -687,6 +752,11 @@ class CarNavEnv(_BaseEnv):
         # circle-obstacle path. Same circles as the collision test, so a range the
         # agent is shown always matches the shape it would hit.
         obstacles = self.traffic.circles(self.car.x, self.car.y, self.cfg.lidar_range)
+        if self.cfg.pedestrians:
+            # People are geometry to the LIDAR as much as vehicles are.
+            people = self.street.circles(self.car.x, self.car.y, self.cfg.lidar_range)
+            if len(people):
+                obstacles = np.concatenate([obstacles, people]) if len(obstacles) else people
         scan = self.lidar.scan(self.city, self.car.x, self.car.y, self.car.heading,
                                obstacles=obstacles)
         dyn = dynamics_features(self.car)
@@ -695,7 +765,11 @@ class CarNavEnv(_BaseEnv):
         traf = self.traffic.obs_features(self.car, self.cfg.n_traffic_obs,
                                         self.cfg.traffic_obs_range,
                                         self.car.p.max_speed)
-        return np.concatenate([scan, dyn, nav, self._tl_features(), traf]).astype(np.float32)
+        ped = self.street.obs_features(self.car, self.cfg.n_ped_obs,
+                                       self.cfg.ped_obs_range, self.car.p.max_speed)
+        signs = self.street.sign_features(self.car, self.cfg.n_sign_obs,
+                                          self.cfg.sign_range, self.car.p.max_speed)
+        return np.concatenate([scan, dyn, nav, self._tl_features(), traf, ped, signs]).astype(np.float32)
 
     def _tl_features(self):
         """Encode the n_tl_obs nearest signals, ego-centrically, in [-1, 1].
@@ -798,6 +872,9 @@ class CarNavEnv(_BaseEnv):
             "is_success": self.terminated_reason == "success",
             "red_light_violations": self.red_light_violations,
             "crash_with": self.crash_with,
+            "speed_limit": (self.street.limit_at(self.car.x, self.car.y)
+                            if self.cfg.speed_signs else None),
+            "pedestrians_on_road": int(self.street.on_road().sum()),
         }
 
     # ------------------------------------------------------------------
