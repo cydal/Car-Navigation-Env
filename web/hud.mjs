@@ -146,18 +146,18 @@ export const hud = {
       ctx.strokeStyle = '#f2f2ee'; ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.moveTo(px(c.x - c.perp[0] * 5), py(c.y - c.perp[1] * 5)); ctx.lineTo(px(c.x + c.perp[0] * 5), py(c.y + c.perp[1] * 5)); ctx.stroke();
     }
-    world.targets.slice(m.target_idx).forEach(([x, y], i) => { ctx.fillStyle = i === 0 ? '#3fd08a' : '#ffb020'; ctx.fillRect(px(x) - 3, py(y) - 3, 6, 6); });
+    world.targets.slice(m.target_idx).forEach(([x, y], i) => { ctx.fillStyle = i === 0 ? '#4be07a' : '#ffb84d'; ctx.fillRect(px(x) - 3, py(y) - 3, 6, 6); });
     // Other vehicles are deliberately not drawn here: at this scale their dots and
     // the ego arrow all read as "a dot on a map", and the one that matters gets
-    // lost in the crowd. A white halo behind the amber arrow keeps it legible
-    // over both the dark road and the lighter building fill.
+    // lost in the crowd. A white halo behind the brand-coloured arrow keeps it
+    // legible over both the dark road and the lighter building fill.
     const e = m.ego, cx = px(e.x), cy = py(e.y), a = e.heading, s = 6;
     const tip = [cx + Math.cos(a) * s, cy + Math.sin(a) * s];
     const l1 = [cx + Math.cos(a + 2.5) * s * 0.8, cy + Math.sin(a + 2.5) * s * 0.8];
     const l2 = [cx + Math.cos(a - 2.5) * s * 0.8, cy + Math.sin(a - 2.5) * s * 0.8];
     ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
     ctx.beginPath(); ctx.moveTo(...tip); ctx.lineTo(...l1); ctx.lineTo(...l2); ctx.closePath(); ctx.stroke();
-    ctx.fillStyle = '#ffb020';
+    ctx.fillStyle = '#3ec6ff';
     ctx.beginPath(); ctx.moveTo(...tip); ctx.lineTo(...l1); ctx.lineTo(...l2); ctx.closePath(); ctx.fill();
   },
 

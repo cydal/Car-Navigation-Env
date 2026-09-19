@@ -13,15 +13,19 @@ const hash01 = (a, b) => { const h = Math.sin(a * 12.9898 + b * 78.233) * 43758.
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const srgb = (r, g, b) => new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace);
 
+// UI/brand colours (ego, markers, sensors, LIDAR) live here, matching web/style.css's
+// --brand/--coral/--gold/--rose/--spring/--violet/--pink tokens -- one identity across
+// the 3D scene and the 2D chrome. Road/signal furniture below (kerb, mast, lamp colours)
+// is deliberately left alone: those simulate real-world objects, not brand choices.
 const C = {
   kerb: 0xa9adb3, white: 0xf2f2ee, amber: 0xf1d67a,
-  ego: 0xffb020, target: 0x3fd08a, next: 0xffb020,
+  ego: 0x3ec6ff, target: 0x4be07a, next: 0xffb84d,
   mast: 0x2a2d33, plate: 0x14161a, pole: 0x6f757d, lampGlow: 0xfff0c8,
   lampOn: [0xff2a1a, 0xffd22a, 0x2aff44], lampOff: [0x3a0d0b, 0x3a300b, 0x0b3a10],
-  near: new THREE.Color(0xff4d3d), far: new THREE.Color(0x3fd08a),
+  near: new THREE.Color(0xff3d68), far: new THREE.Color(0x4be07a),
 };
 const HEIGHT = 1.35;   // body height every vehicle mesh is fitted to (matches the physics box)
-const SENSOR_COLORS = { front: 0x2ad1c9, left: 0x7fd8ff, right: 0x7fd8ff, rear: 0xb59cff };
+const SENSOR_COLORS = { front: 0xff8659, left: 0xffb84d, right: 0xffb84d, rear: 0x8f7cff };
 
 // World/terrain presets (server-selected, named in `city.theme`). Each one is just a
 // different bundle of appearance choices over the *same* tile grid `buildCity` always
@@ -216,7 +220,7 @@ export class Scene {
     this.overlay = new THREE.Group(); this.scene.add(this.overlay);
     this.lidar = null; this.lidarOffsets = [];
     const line = color => new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
-    this.intentLine = line(C.ego); this.goalLine = line(0x2ad1c9);
+    this.intentLine = line(C.ego); this.goalLine = line(0xff6ba8);
     this.overlay.add(this.intentLine, this.goalLine);
     this.resize();
   }
