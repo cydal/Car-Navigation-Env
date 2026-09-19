@@ -325,7 +325,13 @@ export class Scene {
       if (k >= this.outlinePool.length || idx >= view.vehicles.x.length) continue;
       const o = this.outlinePool[k++];
       const len = v.length[idx] ?? 4.4, wid = v.width[idx] ?? 1.9;
-      o.scale.set(wid + 0.2, HEIGHT + 0.15, len + 0.2);
+      // Local X is the forward/length axis, Z is the right/width axis -- same
+      // convention as fallbackVehicle's `BoxGeometry(length, HEIGHT, width)` and
+      // every other oriented box here, and the only one `rotation.y = -heading`
+      // orients correctly. This was backwards (wid on X, len on Z), which rotated
+      // the box's *shape* 90 deg off the car regardless of applying the right
+      // per-vehicle heading below.
+      o.scale.set(len + 0.2, HEIGHT + 0.15, wid + 0.2);
       o.position.set(view.vehicles.x[idx], (HEIGHT + 0.15) / 2, view.vehicles.y[idx]);
       o.rotation.y = -view.vehicles.heading[idx];   // same "-heading" convention as the vehicle mesh itself
       o.material.color.setHex(color);
