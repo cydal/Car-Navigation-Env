@@ -247,7 +247,7 @@ class GapFollower:
         idx = int(round((angle + np.pi) / (2.0 * np.pi) * self.n_beams)) % self.n_beams
         return float(clear[idx])
 
-    def act(self, obs):
+    def act(self, obs, info=None):
         scan, dyn, nav, tl, traf = self.unpack(obs)
         speed = float(dyn[0]) * self.max_speed
         bearing = float(np.arctan2(nav[1], nav[2]))
@@ -369,3 +369,52 @@ class GapFollower:
         # `throttle` here is already the signed [-1, 1] channel the env expects (this
         # driver never reverses, so it stays in [0, 1]); `brake` is rescaled to [0, 1].
         return np.array([throttle, brake * 2.0 - 1.0, steer], dtype=np.float32)
+
+    def diagnostics(self):
+        """What this controller chose and which constraint bound it, for a HUD.
+
+        This picks a heading by clearance-vs-goal score, then caps speed by
+        the tightest of: cruise, stopping within the chosen clearance, a
+        steering-dependent corner speed, the next red/yellow, and a predicted
+        traffic conflict. `self.last` (set at the end of `act`) records the
+        inputs; the binding cap is recovered here by matching the final
+        target speed against each cap. Lives here, not in a caller, because
+        only this class knows what its own private `.last` fields mean --
+        a generic HUD/server has no business reaching into a specific
+        controller's internals to reconstruct this.
+        """
+        last = getattr(self, "last", None)
+        if not last:
+            return {"intent": "starting"}
+        target = float(last["target_speed"])
+        room = max(0.0, float(last["chosen_clear"]) - self.stop_margin)
+        caps = {
+            "cruise": self.cruise_speed,
+            "clearance": float(np.sqrt(2.0 * self.brake_decel * room)),
+            "turn": self.cruise_speed * (1.0 - 0.45 * abs(float(last["steer"]))),
+            "signal": last["v_light"],
+            "traffic": last["v_traffic"],
+        }
+        # Signal and traffic are checked first: they're applied after the
+        # creep-floor clip, so when they bind the match against target is
+        # exact. A target below cruise that matches no cap was clipped to
+        # the creep floor by the clearance term.
+        intent = "cruise"
+        if last["fell_back"]:
+            intent = "no_safe_heading"
+        else:
+            for name in ("signal", "traffic", "clearance", "turn"):
+                v = caps[name]
+                if v is not None and v < self.cruise_speed - 1e-3 and abs(float(v) - target) < 1e-3:
+                    intent = name
+                    break
+            if intent == "cruise" and target < self.cruise_speed - 0.5:
+                intent = "clearance"
+        return {
+            "intent": intent, "target_speed": target, "speed": last["speed"],
+            "theta_deg": last["theta"], "bearing_deg": last["bearing"],
+            "chosen_clear": last["chosen_clear"], "need": last["need"],
+            "min_clear": last["min_clear"], "steer": last["steer"],
+            "in_corridor": bool(last["in_corridor"]), "centering": last["centering"],
+            "cruise": self.cruise_speed, "caps": caps,
+        }

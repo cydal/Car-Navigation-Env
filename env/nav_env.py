@@ -20,6 +20,7 @@ import numpy as np
 from .world import ProceduralCity, CityConfig
 from .car import Car, CarParams
 from .sensors import Lidar, Radar, nav_features, dynamics_features, relative_bearing
+from .perception import Perception
 from .traffic import Traffic, TRAFFIC_FEATURES
 
 try:                                    # gymnasium is optional
@@ -175,6 +176,8 @@ class EnvConfig:
         n_radar_sectors=8,
         radar_range=60.0,
         radar_noise=0.0,
+        # --- perception (auxiliary sensor; never enters the observation vector)
+        perception=True,
     ):
         self.n_targets = n_targets              # waypoints per episode
         self.n_lookahead = n_lookahead          # waypoints exposed in the observation
@@ -217,6 +220,10 @@ class EnvConfig:
         self.n_radar_sectors = n_radar_sectors
         self.radar_range = radar_range
         self.radar_noise = radar_noise
+        # Same auxiliary discipline as radar: no noise model, no RNG stream,
+        # no observation-block width -- turning it off just stops the
+        # renderer/HUD from reading it.
+        self.perception = perception
 
 
 class CarNavEnv(_BaseEnv):
@@ -280,6 +287,7 @@ class CarNavEnv(_BaseEnv):
             noise_std=self.cfg.radar_noise,
             rng=self.rng,
         )
+        self.perception = Perception()
 
         # --- episode state
         self.targets = []
@@ -433,6 +441,8 @@ class CarNavEnv(_BaseEnv):
         self.traffic.reset(x, y)
         if self.cfg.radar:
             self.radar.scan(self.traffic, self.car)
+        if self.cfg.perception:
+            self.perception.scan(self.traffic, self.car)
 
         self.target_idx = 0
         self.step_count = 0
@@ -576,6 +586,8 @@ class CarNavEnv(_BaseEnv):
 
         if self.cfg.radar:
             self.radar.scan(self.traffic, self.car)
+        if self.cfg.perception:
+            self.perception.scan(self.traffic, self.car)
 
         self.episode_reward += reward
         info = self._info()
