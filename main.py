@@ -21,7 +21,7 @@ import numpy as np
 
 from env.world import CityConfig
 from env.nav_env import CarNavEnv, EnvConfig
-from baselines.scripted import GapFollower
+from agents import load_agent
 
 
 def build_env(args, obs_type, renderer=None, image_size=64):
@@ -31,8 +31,8 @@ def build_env(args, obs_type, renderer=None, image_size=64):
                      seed=args.seed, renderer=renderer, image_size=image_size)
 
 
-def make_driver(env):
-    return GapFollower.for_env(env)
+def make_driver(env, agent_spec="scripted"):
+    return load_agent(agent_spec, env)
 
 
 # ----------------------------------------------------------------------
@@ -119,7 +119,7 @@ def cmd_shots(args):
 
     r = PandaRenderer(offscreen=True, size=args.image_size)
     env = build_env(args, "both", renderer=r, image_size=args.image_size)
-    driver = make_driver(env)
+    driver = make_driver(env, args.agent)
     frames = []
     ep = 0
     while len(frames) < 8 and ep < 12:
@@ -150,11 +150,13 @@ def cmd_shots(args):
 def cmd_demo(args):
     from render.panda_renderer import PandaRenderer
     from render.hud import Hud
+    from agents import ManualAgent
 
     renderer = PandaRenderer(offscreen=False, size=args.window, show_rays=not args.no_rays,
                              show_cameras=not args.no_cameras, smooth=args.smooth)
     env = build_env(args, "vector", renderer=renderer)
-    driver = make_driver(env)
+    driver = make_driver(env, args.agent)
+    manual_agent = ManualAgent()
     base = renderer.base
 
     state = {"obs": None, "info": {}, "paused": False, "manual": args.keys}
@@ -163,27 +165,20 @@ def cmd_demo(args):
 
     hud = Hud(base)
 
-    keys = {}
     for k in ("arrow_up", "arrow_down", "arrow_left", "arrow_right"):
-        base.accept(k, keys.__setitem__, [k, True])
-        base.accept(k + "-up", keys.__setitem__, [k, False])
+        key = {"arrow_up": "up", "arrow_down": "down",
+              "arrow_left": "left", "arrow_right": "right"}[k]
+        base.accept(k, lambda k=key: manual_agent.set_keys(**{k: True}))
+        base.accept(k + "-up", lambda k=key: manual_agent.set_keys(**{k: False}))
     base.accept("escape", sys.exit)
     base.accept("r", lambda: (env.reset(), driver.reset()))
     base.accept("space", lambda: state.__setitem__("paused", not state["paused"]))
     base.accept("m", lambda: state.__setitem__("manual", not state["manual"]))
 
-    def manual_action():
-        # Signed throttle: up drives forward, down reverses (there is no separate
-        # manual brake key -- releasing throttle already coasts the car down, and
-        # holding down past zero speed backs it up, same as a simple RC car).
-        thr = (1.0 if keys.get("arrow_up") else 0.0) - (1.0 if keys.get("arrow_down") else 0.0)
-        steer = (1.0 if keys.get("arrow_right") else 0.0) - \
-                (1.0 if keys.get("arrow_left") else 0.0)
-        return np.array([thr, -1.0, steer], dtype=np.float32)
-
     def update(task):
         if not state["paused"]:
-            act = manual_action() if state["manual"] else driver.act(state["obs"])
+            active = manual_agent if state["manual"] else driver
+            act = active.act(state["obs"], state["info"])
             state["obs"], _, te, tr, state["info"] = env.step(act)
             renderer.sync(env)
             if te or tr:
@@ -207,7 +202,7 @@ def cmd_serve(args):
     from serve.server import main as serve_main
     serve_main(host=args.host, port=args.port, seed=args.seed, map_size=args.map,
                n_targets=args.targets, traffic=args.traffic, world=args.world,
-               manual=args.keys, rate=args.rate)
+               agent=args.agent, manual=args.keys, rate=args.rate)
 
 
 # ----------------------------------------------------------------------
@@ -222,6 +217,9 @@ def main():
                     help="serve: traffic preset")
     ap.add_argument("--world", default="city", choices=["city", "suburbs", "rural", "industrial"],
                     help="serve: world/terrain preset")
+    ap.add_argument("--agent", default="scripted",
+                    help="demo/shots/serve: 'scripted', 'random', 'manual', or a path to "
+                         "a custom agent's JSON config (see agents/loader.py)")
     ap.add_argument("--rate", type=float, default=1.0,
                     help="serve: simulation speed relative to real time")
     ap.add_argument("--seed", type=int, default=0)

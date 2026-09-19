@@ -43,15 +43,20 @@ export const hud = {
     const e = m.ego, info = m.info || {}, d = m.driver || {};
     $('driverDot').className = 'dot live';
     $('tickRate').textContent = `${fmt(1000 / Math.max(1, tickMs), 0)} Hz${m.rate !== 1 ? ` · ${m.rate}×` : ''}`;
-    const chip = $('modeChip'); chip.textContent = m.manual ? 'manual' : 'scripted'; chip.classList.toggle('manual', m.manual);
+    const chip = $('modeChip'); chip.textContent = m.manual ? 'manual' : (d.kind || 'agent'); chip.classList.toggle('manual', m.manual);
 
-    // Speed and the driver's target.
-    const kmh = e.speed * 3.6, cruise = (d.cruise ?? world.cfg.cruise_speed) * 3.6;
+    // Speed and the driver's target, when the active agent's diagnostics offer
+    // one -- GapFollower does (a "cruise speed" it steers toward), a custom
+    // agent might not, and the ring/note just fall back to '—' either way.
+    const kmh = e.speed * 3.6;
+    const cruiseSpeed = d.cruise ?? world.cfg.cruise_speed;
+    const hasTarget = !m.manual && d.target_speed !== undefined;
     $('speedNum').textContent = Math.round(kmh);
     const ring = $('targetRing');
-    ring.textContent = d.mode === 'scripted' && d.target_speed !== undefined ? Math.round(d.target_speed * 3.6) : '—';
-    ring.classList.toggle('over', kmh > cruise + 2);
-    $('postedNote').textContent = d.mode === 'scripted' ? `driver target · cruise ${Math.round(cruise)}` : 'manual · arrows drive';
+    ring.textContent = hasTarget ? Math.round(d.target_speed * 3.6) : '—';
+    ring.classList.toggle('over', cruiseSpeed != null && kmh > cruiseSpeed * 3.6 + 2);
+    $('postedNote').textContent = m.manual ? 'manual · arrows drive'
+      : hasTarget ? `driver target · cruise ${Math.round(cruiseSpeed * 3.6)}` : `${d.kind || 'agent'} driving`;
 
     // Reward.
     $('epReward').textContent = fmt(info.episode_reward, 1);
@@ -100,16 +105,23 @@ export const hud = {
     this.endCard(m, world);
   },
 
+  // Detection counts come straight from the server's occlusion-aware scan
+  // (env/perception.py) -- this used to be a client-side cone test with no
+  // occlusion, faking what a camera "sees"; now it just displays what the
+  // simulation actually computed.
   feeds(m) {
-    const e = m.ego, v = m.vehicles;
-    for (const [name, f] of Object.entries(FEEDS)) {
-      const half = f.hfov / 2 * Math.PI / 180; let n = 0;
-      for (let i = 0; i < v.x.length; i++) {
-        const dx = v.x[i] - e.x, dy = v.y[i] - e.y; if (Math.hypot(dx, dy) > f.range) continue;
-        let b = Math.atan2(dy, dx) - e.heading - f.physYaw; b = Math.atan2(Math.sin(b), Math.cos(b));
-        if (Math.abs(b) <= half) n++;
-      }
-      const el = document.querySelector(`.feed[data-cam="${name}"] em`); el.textContent = n; el.classList.toggle('some', n > 0);
+    const cams = (m.perception && m.perception.cameras) || {};
+    for (const name of Object.keys(FEEDS)) {
+      const n = (cams[name] || []).length;
+      const el = document.querySelector(`.feed[data-cam="${name}"] em`);
+      el.textContent = n; el.classList.toggle('some', n > 0);
+    }
+    const bs = (m.perception && m.perception.blind_spots) || {};
+    for (const side of ['left', 'right']) {
+      const el = $(side === 'left' ? 'bsLeft' : 'bsRight');
+      if (!el) continue;
+      const occupied = Boolean(bs[side] && bs[side].occupied);
+      el.classList.toggle('hit', occupied);
     }
   },
 

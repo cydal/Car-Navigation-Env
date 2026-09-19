@@ -53,6 +53,8 @@ input[type=number] { width: 70px; }
 .srow span i.hot { color: var(--amber); }
 .srow span i.red { color: var(--red); }
 .srow span i.green { color: var(--green); }
+.srow span i.bs { display: inline-block; width: 20px; text-align: center; padding: 1px 0; margin-right: 4px; border-radius: 5px; background: rgba(255,255,255,.08); font-weight: 700; color: var(--dim); }
+.srow span i.bs.hit { background: var(--amber); color: #1a1200; }
 
 .driver { grid-column: 3; grid-row: 2 / span 2; align-self: start; max-height: 100%; overflow: auto; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); backdrop-filter: blur(10px); z-index: 4; display: flex; flex-direction: column; gap: 10px; }
 .driver-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }

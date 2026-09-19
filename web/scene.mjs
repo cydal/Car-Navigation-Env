@@ -21,6 +21,7 @@ const C = {
   near: new THREE.Color(0xff4d3d), far: new THREE.Color(0x3fd08a),
 };
 const HEIGHT = 1.35;   // body height every vehicle mesh is fitted to (matches the physics box)
+const SENSOR_COLORS = { front: 0x2ad1c9, left: 0x7fd8ff, right: 0x7fd8ff, rear: 0xb59cff };
 
 // World/terrain presets (server-selected, named in `city.theme`). Each one is just a
 // different bundle of appearance choices over the *same* tile grid `buildCity` always
@@ -220,7 +221,94 @@ export class Scene {
     this.buildVehicles(m);
     this.buildEgo(m);
     this.buildLidar(m);
+    if (m.cameras) {
+      this.setCameraSpecs(m.cameras);
+      this.buildFovWedges(m.cameras);   // built once; the rig never changes between resets
+    }
+    this.buildDetectionOutlines();
     this.first = true;
+  }
+
+  // Mount the 4 feed cameras (and, below, the FOV wedges) at the exact specs
+  // `env/perception.py` used for its occlusion scan -- sent once in the reset
+  // message -- instead of a second hand-copied constant here that could
+  // quietly drift from the one driving the actual detections.
+  setCameraSpecs(specs) {
+    for (const [name, spec] of Object.entries(specs)) {
+      const cam = this.feedCams[name];
+      if (!cam) continue;
+      const height = (FEEDS[name] && FEEDS[name].pos[1]) || 1.1;
+      cam.position.set(spec.forward, height, spec.right);
+      // The camera's default gaze is local -Z; this is the rotation.y that
+      // points it along physics bearing `spec.yaw` relative to the ego's own
+      // heading (derived the same way every other mesh's -heading rotation
+      // is: solving Ry(theta)*(0,0,-1) = (cos yaw, 0, sin yaw) for theta).
+      cam.rotation.y = Math.atan2(-Math.cos(spec.yaw), -Math.sin(spec.yaw));
+      cam.userData.hfov = spec.fov;
+    }
+  }
+
+  buildFovWedges(specs) {
+    if (this.fovWedgeGroup) return;                    // same rig every reset; build once
+    const g = new THREE.Group();
+    for (const [name, spec] of Object.entries(specs)) {
+      const half = THREE.MathUtils.degToRad(spec.fov) / 2, r = Math.min(spec.range, 40), N = 24;
+      const pos = [];
+      for (let i = 0; i < N; i++) {
+        const a0 = -half + (2 * half) * i / N, a1 = -half + (2 * half) * (i + 1) / N;
+        // Local x = forward, z = right (matches every vehicle mesh's own axes),
+        // y = 0 -- already flat on the ground, no extra rotation needed.
+        pos.push(0, 0, 0, Math.cos(a0) * r, 0, Math.sin(a0) * r, Math.cos(a1) * r, 0, Math.sin(a1) * r);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color: SENSOR_COLORS[name] || 0xffffff, transparent: true, opacity: 0.14,
+        side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+      const holder = new THREE.Group(); holder.add(mesh);
+      holder.position.set(spec.forward, 0.04, spec.right);
+      holder.rotation.y = -spec.yaw;                    // same "-angle" convention as every heading rotation
+      g.add(holder);
+    }
+    this.fovWedgeGroup = g;
+    this.ego.add(g);                                    // rides along with the car for free
+  }
+
+  buildDetectionOutlines() {
+    if (this.outlinePool) return;
+    this.outlinePool = [];
+    const geo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
+    for (let i = 0; i < 24; i++) {
+      const mesh = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 0.9 }));
+      mesh.visible = false;
+      this.overlay.add(mesh);
+      this.outlinePool.push(mesh);
+    }
+  }
+
+  // Outline whichever vehicles `env/perception.py` actually detected this tick,
+  // coloured by the (first) camera that sees each one -- a visible answer to
+  // "what does the car's camera see", not just a badge count on the feed tile.
+  updateDetections(view, world) {
+    if (!this.outlinePool) return;
+    for (const o of this.outlinePool) o.visible = false;
+    if (!this.overlays || !view.perception) return;
+    const seen = new Map();
+    for (const [name, dets] of Object.entries(view.perception.cameras || {})) {
+      for (const d of dets) if (!seen.has(d.id)) seen.set(d.id, SENSOR_COLORS[name] ?? 0xffffff);
+    }
+    const v = world.vehicles;
+    let k = 0;
+    for (const [idx, color] of seen) {
+      if (k >= this.outlinePool.length || idx >= view.vehicles.x.length) continue;
+      const o = this.outlinePool[k++];
+      const len = v.length[idx] ?? 4.4, wid = v.width[idx] ?? 1.9;
+      o.scale.set(wid + 0.2, HEIGHT + 0.15, len + 0.2);
+      o.position.set(view.vehicles.x[idx], (HEIGHT + 0.15) / 2, view.vehicles.y[idx]);
+      o.material.color.setHex(color);
+      o.visible = true;
+    }
   }
 
   // Swaps the sky dome and fog to match a theme; a no-op past the first call for a given
@@ -470,7 +558,7 @@ export class Scene {
       }
       pos.needsUpdate = col.needsUpdate = true;
       const d = view.driver;
-      if (d && d.mode === 'scripted' && typeof d.theta_deg === 'number') {
+      if (d && !view.manual && typeof d.theta_deg === 'number') {
         const th = e.heading + d.theta_deg * Math.PI / 180, len = clamp(d.chosen_clear, 3, 28);
         this.intentLine.geometry.setFromPoints([V(e.x, e.y, 0.3), V(e.x + Math.cos(th) * len, e.y + Math.sin(th) * len, 0.3)]);
         const bh = e.heading + d.bearing_deg * Math.PI / 180;
@@ -478,6 +566,8 @@ export class Scene {
         this.intentLine.visible = this.goalLine.visible = true;
       } else this.intentLine.visible = this.goalLine.visible = false;
     }
+    if (this.fovWedgeGroup) this.fovWedgeGroup.visible = this.overlays;
+    this.updateDetections(view, world);
 
     // Sun follows the car so the shadow frustum stays tight; sky dome follows the camera.
     this.sun.position.set(e.x + 40, 70, e.y + 30); this.sun.target.position.set(e.x + fx * 15, 0, e.y + fy * 15); this.sun.target.updateMatrixWorld();

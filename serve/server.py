@@ -30,8 +30,9 @@ from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
-from baselines.scripted import GapFollower
+from agents import ManualAgent, load_agent
 from env.nav_env import CarNavEnv, EnvConfig
+from env.perception import CAMERAS
 from env.traffic import VEHICLE_KINDS
 from env.world import CityConfig
 
@@ -92,15 +93,16 @@ class Session:
     """One env + driver, stepped in real time, serialised for the browser."""
 
     def __init__(self, seed=0, map_size=48, n_targets=3, traffic="normal", world="city",
-                 manual=False, rate=1.0):
+                 agent="scripted", manual=False, rate=1.0):
         self.map_size = map_size
         self.n_targets = n_targets
+        self.agent_spec = agent
         self.manual = manual
         self.rate = rate
         self.paused = False
         self.step_once = False
         self.auto_restart = True
-        self.keys = {"up": False, "down": False, "left": False, "right": False}
+        self.manual_agent = ManualAgent()
         self.episode = 0
         self.seed = int(seed)
         self.build(self.seed, traffic, world)
@@ -118,34 +120,32 @@ class Session:
         city_kwargs.update(city_overrides)
         city = CityConfig(**city_kwargs)
         self.env = CarNavEnv(config=cfg, city_config=city, obs_type="vector", seed=seed)
-        self.driver = GapFollower.for_env(self.env)
+        # Session never imports a specific controller: whatever `agent_spec`
+        # names (a built-in name or a custom JSON config), `load_agent` hands
+        # back something satisfying only `reset()`/`act(obs)`/`diagnostics()`.
+        self.agent = load_agent(self.agent_spec, self.env)
         self.reset(seed)
 
     def reset(self, seed=None):
         if seed is not None:
             self.seed = int(seed)
         self.obs, self.info = self.env.reset(seed=self.seed)
-        self.driver.reset()
-        self.driver.last = None
+        self.agent.reset()
+        self.manual_agent.reset()
         self.episode += 1
         self.action = np.zeros(3, dtype=np.float32)
         self.reward = 0.0
         self.done = None
         self.restart_at = None
 
-    def manual_action(self):
-        # Signed throttle: up drives forward, down reverses -- no separate manual
-        # brake key, same convention as main.py's --keys demo.
-        k = self.keys
-        thr = (1.0 if k["up"] else 0.0) - (1.0 if k["down"] else 0.0)
-        return np.array([thr, -1.0,
-                         (1.0 if k["right"] else 0.0) - (1.0 if k["left"] else 0.0)],
-                        dtype=np.float32)
+    @property
+    def active_agent(self):
+        return self.manual_agent if self.manual else self.agent
 
     def step(self):
         if self.done:
             return
-        act = self.manual_action() if self.manual else self.driver.act(self.obs)
+        act = self.active_agent.act(self.obs, self.info)
         self.action = act
         self.obs, self.reward, terminated, truncated, self.info = self.env.step(act)
         if terminated or truncated:
@@ -154,54 +154,16 @@ class Session:
                 self.restart_at = time.monotonic() + RESTART_DELAY_S
 
     # ------------------------------------------------------------------
-    def driver_state(self):
-        """What the scripted driver chose and which constraint bound it.
-
-        GapFollower picks a heading by clearance-vs-goal score, then caps speed
-        by the tightest of: cruise, stopping within the chosen clearance, a
-        steering-dependent corner speed, the next red/yellow, and a predicted
-        traffic conflict. `last` records the inputs; the binding cap is recovered
-        here by matching the final target against each cap.
-        """
-        if self.manual:
-            return {"mode": "manual", "intent": "manual"}
-        last = getattr(self.driver, "last", None)
-        if not last:
-            return {"mode": "scripted", "intent": "starting"}
-        d = self.driver
-        target = float(last["target_speed"])
-        room = max(0.0, float(last["chosen_clear"]) - d.stop_margin)
-        caps = {
-            "cruise": d.cruise_speed,
-            "clearance": float(np.sqrt(2.0 * d.brake_decel * room)),
-            "turn": d.cruise_speed * (1.0 - 0.45 * abs(float(last["steer"]))),
-            "signal": last["v_light"],
-            "traffic": last["v_traffic"],
-        }
-        # The binding cap is the one equal to the final target. Signal and traffic
-        # are checked first: they are applied after the creep-floor clip, so when
-        # they bind the match is exact. A target below cruise that matches no cap
-        # was clipped to the creep floor by the clearance term.
-        intent = "cruise"
-        if last["fell_back"]:
-            intent = "no_safe_heading"
-        else:
-            for name in ("signal", "traffic", "clearance", "turn"):
-                v = caps[name]
-                if v is not None and v < d.cruise_speed - 1e-3 and abs(float(v) - target) < 1e-3:
-                    intent = name
-                    break
-            if intent == "cruise" and target < d.cruise_speed - 0.5:
-                intent = "clearance"
-        return _py({
-            "mode": "scripted", "intent": intent,
-            "target_speed": target, "speed": last["speed"],
-            "theta_deg": last["theta"], "bearing_deg": last["bearing"],
-            "chosen_clear": last["chosen_clear"], "need": last["need"],
-            "min_clear": last["min_clear"], "steer": last["steer"],
-            "in_corridor": bool(last["in_corridor"]), "centering": last["centering"],
-            "cruise": d.cruise_speed, "caps": caps,
-        })
+    def agent_diagnostics(self):
+        """Whatever the currently-active agent wants to show, plus generic
+        bookkeeping (`manual`, `kind`) the server can supply for any agent
+        without knowing anything about its internals. `diagnostics()` is
+        optional on the Agent interface -- an agent that doesn't implement it
+        just contributes no extra fields, which every consumer already has
+        to treat as optional."""
+        active = self.active_agent
+        d = active.diagnostics() if hasattr(active, "diagnostics") else {}
+        return _py({"manual": self.manual, "kind": type(active).__name__, **d})
 
     def reset_message(self):
         env, city, t = self.env, self.env.city, self.env.traffic
@@ -228,8 +190,14 @@ class Session:
                     "n_targets": env.cfg.n_targets, "lidar_range": env.cfg.lidar_range,
                     "n_beams": env.cfg.n_beams, "radar_range": env.cfg.radar_range,
                     "n_radar_sectors": env.cfg.n_radar_sectors,
-                    "cruise_speed": self.driver.cruise_speed},
+                    # Only meaningful for agents that have a notion of "cruise
+                    # speed" (GapFollower does); anything else leaves this null
+                    # rather than the server assuming every agent has one.
+                    "cruise_speed": getattr(self.agent, "cruise_speed", None)},
             "lidar_offsets": _arr(env.lidar.offsets, 4),
+            "cameras": {name: {"forward": fwd, "right": right, "yaw": yaw,
+                               "fov": fov, "range": rng}
+                       for name, (fwd, right, yaw, fov, rng) in CAMERAS.items()},
         }
 
     def tick_message(self):
@@ -254,9 +222,16 @@ class Session:
             "radar": {"dist": _arr(env.radar.last_distances, 1),
                       "closing": _arr(env.radar.last_closing_speed, 2),
                       "idx": env.radar.last_target_idx.tolist()},
+            "perception": {
+                "cameras": {name: [{"id": i, "dist": round(d, 1),
+                                    "bearing_deg": round(np.degrees(b), 1)}
+                                   for i, d, b in dets]
+                           for name, dets in env.perception.cameras.items()},
+                "blind_spots": env.perception.blind_spots,
+            },
             "reward": round(float(self.reward), 4),
             "info": _py({k: info.get(k) for k in INFO_KEYS}),
-            "driver": self.driver_state(),
+            "driver": self.agent_diagnostics(),
             "paused": self.paused, "manual": self.manual, "rate": self.rate,
             "auto_restart": self.auto_restart,
             "done": self.done, "restart_in": restart_in,
@@ -316,7 +291,7 @@ class Server:
                 self.send_all(s.reset_message())
         elif kind == "mode":
             s.manual = bool(cmd.get("manual"))
-            s.keys = {k: False for k in s.keys}
+            s.manual_agent.reset()
         elif kind == "auto":
             s.auto_restart = bool(cmd.get("on"))
             if s.done:
@@ -327,7 +302,7 @@ class Server:
             except (TypeError, ValueError):
                 pass
         elif kind == "keys":
-            s.keys = {k: bool(cmd.get(k)) for k in s.keys}
+            s.manual_agent.set_keys(**{k: cmd.get(k) for k in s.manual_agent.keys})
         self.send_all(s.tick_message())
 
     def send_all(self, msg):
