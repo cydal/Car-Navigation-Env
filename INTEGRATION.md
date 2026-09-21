@@ -671,6 +671,36 @@ dependency) for the collect-now-train-later-in-a-different-process workflow.
 `RecordingWrapper` is sugar for calling `buffer.add(...)` by hand every step;
 use whichever fits your loop.
 
+**Banking frames for later, without training on them now.** Both buffer
+classes take an eighth, optional field on `add(..., frame=None)`, separate
+from `obs`/`next_obs`, precisely so it never has to change what a policy
+trains on:
+
+```python
+import carnav
+from replay import ReplayBuffer, RecordingWrapper
+
+env = carnav.make(render_mode="rgb_array")             # obs_type stays "vector"
+env = RecordingWrapper(env, ReplayBuffer(200_000), capture_frames=True)
+obs, info = env.reset()                                # obs is still the vector
+...
+batch = env.buffer.sample(256)
+batch["obs"]      # (256, vector_dim) -- what a vector-only policy trains on today
+batch["frame"]    # (256, H, W, 3) uint8 -- banked in case an image experiment wants it later
+```
+
+`capture_frames=True` calls `env.render()` every step and stores the result
+in `frame`, which needs `render_mode="rgb_array"` set when the env was built
+(`RecordingWrapper` raises immediately if it isn't, rather than silently
+storing `None` for every step). Leave `capture_frames` at its default `False`
+and this costs nothing: no renderer is built, no frame is captured, and
+`sample()`/`sample_sequences()` hand back `batch["frame"] is None` rather
+than a key you have to work around. `env/nav_env.py` has zero lines of
+frame-capture code either way — `render()` (used here) and `image_obs()`
+(used by `obs_type="image"`/`"both"`) were already both there; this just
+calls the existing one from outside instead of adding a new mechanism.
+Checked in `tests/test_replay.py` §6.
+
 ### `env.perception` — structured camera sensing (auxiliary, like `env.radar`)
 
 `env/perception.py` adds occlusion-aware front/left/right/rear camera

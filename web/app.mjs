@@ -101,6 +101,77 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+// Recording: captures the whole tab (3D view + HUD) via getDisplayMedia, not
+// just the <canvas> -- a plain canvas.captureStream() would drop every panel
+// drawn in the DOM/CSS layer (reward, speed, camera feeds, minimap), which is
+// most of what makes a "look what it can do" clip worth showing. The tradeoff
+// is the one-time browser share-this-tab prompt; Chrome's `preferCurrentTab`
+// hint skips straight to that choice instead of making the user hunt for it.
+const rec = { recorder: null, stream: null, chunks: [], startedAt: 0, timer: null };
+
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    hud.banner('This browser cannot record (no tab/screen capture support).', 'warn');
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false, preferCurrentTab: true });
+  } catch {
+    return;   // user dismissed the share picker -- not an error worth a banner
+  }
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!mime) {
+    hud.banner('This browser cannot record (no supported video codec).', 'warn');
+    stream.getTracks().forEach(t => t.stop());
+    return;
+  }
+  rec.chunks = [];
+  rec.recorder = new MediaRecorder(stream, { mimeType: mime });
+  rec.recorder.ondataavailable = e => { if (e.data.size) rec.chunks.push(e.data); };
+  rec.recorder.onstop = saveRecording;
+  rec.stream = stream;
+  // The browser's own "Stop sharing" control lives outside our UI and ends the
+  // track directly -- listen for that too, or the button/timer would go stale.
+  stream.getVideoTracks()[0].addEventListener('ended', stopRecording);
+  rec.recorder.start();
+  rec.startedAt = performance.now();
+  $('recordBtn').textContent = 'Stop'; $('recordBtn').classList.add('recording');
+  $('recTime').hidden = false;
+  rec.timer = setInterval(() => { $('recTime').textContent = fmtElapsed(performance.now() - rec.startedAt); }, 500);
+}
+
+function stopRecording() {
+  if (rec.recorder && rec.recorder.state !== 'inactive') rec.recorder.stop();
+  if (rec.stream) rec.stream.getTracks().forEach(t => t.stop());
+  clearInterval(rec.timer); rec.timer = null;
+  $('recordBtn').textContent = 'Record'; $('recordBtn').classList.remove('recording');
+  $('recTime').hidden = true;
+}
+
+function saveRecording() {
+  if (!rec.chunks.length) return;
+  const blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || 'video/webm' });
+  const world = state.world || {};
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `carnav-${world.world || 'city'}-seed${world.seed ?? 0}-${stamp}.webm`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  rec.chunks = [];
+}
+
+$('recordBtn').addEventListener('click', () => {
+  if (rec.recorder && rec.recorder.state === 'recording') stopRecording(); else startRecording();
+});
+
 // Controls.
 $('startBtn').addEventListener('click', () => { if (state.curr && state.curr.done) send({ cmd: 'new' }); else send({ cmd: 'toggle' }); });
 $('stepBtn').addEventListener('click', () => send({ cmd: 'step' }));

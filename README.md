@@ -263,6 +263,15 @@ toggles the sensor overlays; world, traffic density and sim rate are in the top
 bar. `tools/viewer_shot.py` screenshots the running page headlessly (Playwright),
 for checking the render from a box with no display.
 
+**Record** captures the whole page — the 3D view *and* the dashboard around it
+(reward, speed, camera feeds) — as a `.webm` video, for showing off what an
+agent can do rather than just describing it. It uses the browser's own tab-
+capture (`getDisplayMedia`), so clicking it asks you to share this tab once;
+after that it's a plain start/stop toggle with an elapsed-time readout, and
+stopping downloads the file automatically. This is a client-only feature —
+nothing is sent back to the Python server, and it works the same way whether
+the server is local or a tunnelled remote box.
+
 ![Aerial view at a junction](docs/viewer-aerial.png)
 
 *The aerial view over the same junction, pedestrians and speed signs on. The lit
@@ -650,6 +659,10 @@ Two things that live next to, but outside, `env/` for the same reason:
   sequence training needs) for whatever training codebase is driving the env.
   `env/nav_env.py` has zero lines of replay-related code; apply
   `RecordingWrapper(env, buffer)` from the outside instead.
+  `RecordingWrapper(env, buffer, capture_frames=True)` additionally banks a
+  rendered frame per step in the buffer's own `frame` field — separate from
+  `obs`/`next_obs`, so a vector-only training run stays vector-only and pays
+  nothing for it unless `capture_frames=True` is actually passed.
 - **`env/perception.py`** — occlusion-aware front/left/right/rear camera
   detections and blind-spot zones, auxiliary like `env.radar` (never in the
   observation vector). This is what the live viewer's camera badges, FOV

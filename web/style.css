@@ -24,6 +24,8 @@ button:hover { background: rgba(255,255,255,.12); }
 button.primary { background: var(--brand); color: #04131f; border-color: transparent; font-weight: 700; }
 button.primary:hover { filter: brightness(1.08); }
 button:disabled { opacity: .45; cursor: not-allowed; }
+button.recording { background: var(--rose); color: #1a0308; border-color: transparent; font-weight: 700; animation: pulse 1.4s infinite; }
+button.recording:hover { filter: brightness(1.08); }
 select, input { background: rgba(255,255,255,.06); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; font-size: 12px; }
 input[type=number] { width: 70px; }
 .label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }

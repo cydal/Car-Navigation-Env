@@ -17,12 +17,24 @@ RNN/transformer trained with BPTT): `ReplayBuffer`'s i.i.d. sampling can't
 give you a temporally contiguous run, because it never promises step t+1 in
 the buffer actually followed step t in the environment.
 
-Both store raw `(obs, action, reward, next_obs, terminated, truncated, info)`
-tuples rather than preallocated typed arrays, deliberately: that makes no
-assumption about `obs`/`action` shape or dtype, so a vector observation, an
+Both store raw `(obs, action, reward, next_obs, terminated, truncated, info,
+frame)` tuples rather than preallocated typed arrays, deliberately: that makes
+no assumption about `obs`/`action` shape or dtype, so a vector observation, an
 image, or an `obs_type="both"` dict all work unchanged, and sampling only
 allocates the batch it returns instead of the whole buffer's worth of
 memory up front.
+
+`frame` is an optional, separate rendered frame -- for training on the vector
+observation today while banking image data for later, without switching
+`obs_type` to `"image"`/`"both"` (which would make the image *the*
+observation a policy trains on, not just something archived alongside it).
+`add(..., frame=None)` costs nothing extra when omitted -- a `None` in a
+tuple slot -- so a training run that never asks for frames pays for exactly
+zero image capture; `RecordingWrapper(env, buffer, capture_frames=True)` is
+the usual way to opt in. `sample()`/`sample_sequences()` only include a
+`"frame"` key with real pixel data when every sampled entry actually has one;
+otherwise it comes back as `None`, so a training loop that never captures
+frames sees no shape it has to work around.
 """
 
 import pickle
@@ -30,7 +42,7 @@ from collections import deque
 
 import numpy as np
 
-_FIELDS = ("obs", "action", "reward", "next_obs", "terminated", "truncated", "info")
+_FIELDS = ("obs", "action", "reward", "next_obs", "terminated", "truncated", "info", "frame")
 
 
 def _stack(items):
@@ -45,8 +57,8 @@ class ReplayBuffer:
         self.capacity = capacity
         self._buf = deque(maxlen=capacity)
 
-    def add(self, obs, action, reward, next_obs, terminated, truncated, info=None):
-        self._buf.append((obs, action, reward, next_obs, terminated, truncated, info))
+    def add(self, obs, action, reward, next_obs, terminated, truncated, info=None, frame=None):
+        self._buf.append((obs, action, reward, next_obs, terminated, truncated, info, frame))
 
     def __len__(self):
         return len(self._buf)
@@ -58,7 +70,7 @@ class ReplayBuffer:
         rng = rng or np.random.default_rng()
         idx = rng.integers(0, len(self._buf), size=batch_size)
         rows = [self._buf[i] for i in idx]
-        obs, action, reward, next_obs, terminated, truncated, info = zip(*rows)
+        obs, action, reward, next_obs, terminated, truncated, info, frame = zip(*rows)
         return {
             "obs": _stack(obs), "action": np.stack(action),
             "reward": np.asarray(reward, dtype=np.float32),
@@ -66,6 +78,7 @@ class ReplayBuffer:
             "terminated": np.asarray(terminated, dtype=bool),
             "truncated": np.asarray(truncated, dtype=bool),
             "info": info,
+            "frame": np.stack(frame) if all(f is not None for f in frame) else None,
         }
 
     def save(self, path):
@@ -87,8 +100,8 @@ class EpisodeBuffer:
         self._episodes = deque(maxlen=capacity_episodes)
         self._current = []
 
-    def add(self, obs, action, reward, next_obs, terminated, truncated, info=None):
-        self._current.append((obs, action, reward, next_obs, terminated, truncated, info))
+    def add(self, obs, action, reward, next_obs, terminated, truncated, info=None, frame=None):
+        self._current.append((obs, action, reward, next_obs, terminated, truncated, info, frame))
         if terminated or truncated:
             self.end_episode()
 
@@ -136,6 +149,9 @@ class EpisodeBuffer:
                 out[name] = np.asarray(per_window, dtype=bool)
             elif name == "reward":
                 out[name] = np.asarray(per_window, dtype=np.float32)
+            elif name == "frame":
+                flat = [f for steps in per_window for f in steps]
+                out[name] = np.asarray(per_window) if all(f is not None for f in flat) else None
             else:                                       # action: keep its native dtype
                 out[name] = np.asarray(per_window)
         return out
