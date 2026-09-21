@@ -67,6 +67,7 @@ class ProceduralCity:
         self.height = self.cfg.height
         self.grid = None
         self.road_cells = None      # (N, 2) array of (row, col) reachable road tiles
+        self.target_cells = None    # road_cells minus dead-end border tails; see _dead_end_tail_mask
         self.intersections = []     # (x, y) world-space centres of every 4-way crossing
         self.signals = []           # the sparse subset of those that get traffic lights
         self.road_nodes = None      # (K, 2) corridor centre-line crossings, incl. T-junctions
@@ -126,6 +127,42 @@ class ProceduralCity:
         self.signals = self._choose_signals(self.intersections)
         self.road_nodes, self.node_links = self._build_road_graph(grid, v_roads, h_roads)
         self.parking_spots = self._parking_spots(grid, self.road_nodes)
+        self.target_cells = self._exclude_dead_end_tails(grid, cells, v_roads, h_roads)
+
+    def _exclude_dead_end_tails(self, grid, cells, v_roads, h_roads):
+        """`road_cells` minus every corridor's dead-end border tail.
+
+        Every v_road/h_road is painted border-to-border in `generate()`
+        regardless of where the *other* axis's crossings fall, so the stretch
+        beyond a corridor's outermost crossing -- out to the map edge -- is
+        real, driveable road with nothing connecting past it: a car can enter
+        it, but only ever turn around. `_block_segments` cannot produce this
+        on its own (it walls off a whole inter-crossing span at once, so both
+        sides it touches go to zero length, not a real stub) -- these border
+        tails are the only dead ends here with meaningful length, up to
+        `max_block` tiles. Fine for a spawn, parking, or traffic to sit in --
+        it's a legitimate stretch of the city, and traffic on rails cannot
+        wander off it anyway -- but a *target* placed deep inside one sends
+        the ego on a there-and-back detour that teaches nothing about the
+        intersection it forked from. Excluding it from the target pool alone
+        (`road_cells` itself is untouched) redistributes that probability
+        mass over the rest of the map rather than clustering waypoints onto
+        intersection centres.
+        """
+        if not v_roads or not h_roads:
+            return cells
+        cfg = self.cfg
+        mask = np.zeros(grid.shape, dtype=bool)
+        y_lo, y_hi = h_roads[0], h_roads[-1] + cfg.road_width
+        for x in v_roads:
+            mask[cfg.border:y_lo, x:x + cfg.road_width] = True
+            mask[y_hi:cfg.height - cfg.border, x:x + cfg.road_width] = True
+        x_lo, x_hi = v_roads[0], v_roads[-1] + cfg.road_width
+        for y in h_roads:
+            mask[y:y + cfg.road_width, cfg.border:x_lo] = True
+            mask[y:y + cfg.road_width, x_hi:cfg.width - cfg.border] = True
+        kept = cells[~mask[cells[:, 0], cells[:, 1]]]
+        return kept if len(kept) > 0 else cells
 
     def _find_intersections(self, grid, v_roads, h_roads):
         """Return world-space (x, y) centres of true 4-way road crossings.
@@ -573,10 +610,17 @@ class ProceduralCity:
     # ------------------------------------------------------------------
     # Spawn sampling
     # ------------------------------------------------------------------
-    def sample_road_point(self, jitter=0.5):
-        """Uniformly sample a world point on a reachable road tile."""
-        idx = self.rng.integers(0, len(self.road_cells))
-        row, col = self.road_cells[idx]
+    def sample_road_point(self, jitter=0.5, cells=None):
+        """Uniformly sample a world point on a reachable road tile.
+
+        `cells` overrides the pool to sample from (default `self.road_cells`)
+        -- `_sample_targets` passes `self.target_cells` so a waypoint never
+        lands in a dead-end border tail; nothing else needs the override.
+        """
+        if cells is None:
+            cells = self.road_cells
+        idx = self.rng.integers(0, len(cells))
+        row, col = cells[idx]
         ts = self.tile_size
         j = jitter * ts * 0.5
         x = (col + 0.5) * ts + self.rng.uniform(-j, j)
@@ -654,7 +698,7 @@ class ProceduralCity:
         x, y = self.sample_road_point()
         return x, y, 0.0
 
-    def sample_point_near(self, x, y, min_dist, max_dist, tries=200):
+    def sample_point_near(self, x, y, min_dist, max_dist, tries=200, cells=None):
         """Sample a road point within an annulus around (x, y).
 
         Used to place targets far enough to be a real navigation problem but
@@ -662,7 +706,7 @@ class ProceduralCity:
         """
         best, best_gap = None, np.inf
         for _ in range(tries):
-            px, py = self.sample_road_point()
+            px, py = self.sample_road_point(cells=cells)
             d = np.hypot(px - x, py - y)
             if min_dist <= d <= max_dist:
                 return px, py

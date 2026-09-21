@@ -392,6 +392,21 @@ model needs. Per-tile shading costs ~1k extra quads.
 connected component and walls off the rest, so a sampled target is never
 unreachable from a sampled spawn.
 
+**A target is never sampled inside a dead-end.** Every v_road/h_road is
+painted border-to-border regardless of where the *other* axis's crossings
+fall, so the stretch beyond a corridor's outermost intersection — out to the
+map edge — is real, driveable road with nothing connecting past it: enterable,
+but only ever a turn-around, up to `max_block` tiles deep. Fine for a spawn,
+for parking, or for traffic (which is on rails and cannot wander off it
+anyway) — but a *waypoint* placed there sends the ego on a there-and-back
+detour that teaches nothing about the intersection it forked from. `city.
+target_cells` excludes exactly those border tails from the pool `_sample_
+targets` draws from (measured: 6–16% of road tiles per map, all of them
+right at the four edges), while `city.road_cells` — what spawn, parking and
+traffic still use — is untouched. A waypoint can still land right at the
+intersection those tails hang off of, which is the one part of "enter the
+dead-end" that was never the problem.
+
 **Right-of-way is decided by the stop line crossed, not by heading.** The obvious
 implementation asks which way the car is pointing (`|sin h| > |cos h|`) and reads
 the N-S or E-W phase accordingly. On a 12 m undivided corridor with no lane

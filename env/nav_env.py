@@ -505,15 +505,22 @@ class CarNavEnv(_BaseEnv):
         return self._observe(), self._info()
 
     def _sample_targets(self):
-        """Chain waypoints so each is a reachable hop from the previous one."""
+        """Chain waypoints so each is a reachable hop from the previous one.
+
+        Sampled from `city.target_cells`, not `city.road_cells` -- excludes
+        dead-end border tails (real road, but nothing connects beyond them)
+        so a waypoint never sends the ego on a there-and-back detour into a
+        stub instead of routing it through the intersection it forked from.
+        """
         self.targets = []
         px, py = self.car.x, self.car.y
         for _ in range(self.cfg.n_targets):
             pt = self.city.sample_point_near(
-                px, py, self.cfg.target_min_dist, self.cfg.target_max_dist
+                px, py, self.cfg.target_min_dist, self.cfg.target_max_dist,
+                cells=self.city.target_cells,
             )
             if pt is None:
-                pt = self.city.sample_road_point()
+                pt = self.city.sample_road_point(cells=self.city.target_cells)
             self.targets.append(pt)
             px, py = pt
 

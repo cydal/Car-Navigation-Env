@@ -48,6 +48,21 @@ n_road = int((city.grid == ROAD).sum())
 assert n_road == len(city.road_cells), f"connectivity mismatch: {n_road} vs {len(city.road_cells)}"
 print("connectivity    : OK (all road tiles mutually reachable)")
 
+# target_cells must be a strict, non-trivial subset of road_cells (dead-end
+# border tails excluded) across many seeds -- road_cells itself untouched, so
+# spawn/parking/traffic keep seeing every reachable tile.
+excl_fracs = []
+for seed in range(30):
+    c = ProceduralCity(CityConfig(width=48, height=48, tile_size=4.0), seed=seed)
+    assert len(c.target_cells) < len(c.road_cells), "target_cells must exclude something"
+    assert len(c.target_cells) > 0.5 * len(c.road_cells), "must not over-exclude"
+    road_set = {tuple(p) for p in c.road_cells}
+    target_set = {tuple(p) for p in c.target_cells}
+    assert target_set <= road_set, "target_cells must stay a subset of road_cells"
+    excl_fracs.append(1 - len(c.target_cells) / len(c.road_cells))
+print(f"target_cells excludes {np.mean(excl_fracs):.1%} of road tiles on average "
+      f"(range {min(excl_fracs):.1%}-{max(excl_fracs):.1%}) over 30 seeds : OK")
+
 print()
 print("=" * 62)
 print("2. MAP PREVIEW (48x48)")
