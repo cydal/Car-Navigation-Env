@@ -796,11 +796,13 @@ class DreamerAgent:
 
 Point `main.py serve` at it (`--agent configs/dreamer.json`, the same JSON-
 config mechanism every custom agent uses) and the rollouts show up
-immediately: translucent lines fanning out from the car in the 3D scene,
-fading toward the end of the horizon, plus an `imagining ×N · H steps` chip
-next to the agent's name in the driver panel — both gated behind the existing
-`sensors` overlay toggle, so turning overlays off hides them along with the
-LIDAR fan and detection boxes. No server-side code has to change for a new
+immediately: a trail of small violet dots ahead of the car, shrinking and
+fading toward the end of the horizon (dots rather than a line so it stays
+legible viewed nearly end-on, and reads as distinct from the LIDAR dots
+around the car), plus an `imagining ×N · H steps` chip next to the agent's
+name in the driver panel — both gated behind the existing `sensors` overlay
+toggle, so turning overlays off hides them along with LIDAR and detection
+boxes. No server-side code has to change for a new
 agent to use this: `serve/server.py` forwards whatever `diagnostics()`
 returns without inspecting its shape (see `agent_diagnostics()` and `_py()`'s
 `np.ndarray` handling in `serve/server.py` — a bare numpy array in the dict is

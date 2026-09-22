@@ -219,11 +219,11 @@ export class Scene {
     }
 
     this.overlay = new THREE.Group(); this.scene.add(this.overlay);
-    this.lidar = null; this.lidarOffsets = [];
+    this.lidarDots = []; this.lidarDotGeo = null; this.lidarOffsets = [];
     const line = color => new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
     this.intentLine = line(C.ego); this.goalLine = line(0xff6ba8);
     this.overlay.add(this.intentLine, this.goalLine);
-    this.imagineLines = [];
+    this.imagineDots = []; this.imagineDotGeo = null; this.imagineDotsPerLine = 0;
     this.resize();
   }
 
@@ -253,7 +253,7 @@ export class Scene {
       this.buildFovWedges(m.cameras);   // built once; the rig never changes between resets
     }
     this.buildDetectionOutlines();
-    this.buildImagineLines();
+    this.buildImagineDots();
     this.first = true;
   }
 
@@ -346,54 +346,60 @@ export class Scene {
     }
   }
 
-  // A pool of ghost-path lines for `Agent.diagnostics()["imagined_trajectories"]"`
+  // A pool of ghost-trail dots for `Agent.diagnostics()["imagined_trajectories"]`
   // (world-model agents like Dreamer, during inference -- see INTEGRATION.md). Not
   // every agent provides this, so the pool just stays empty/invisible when it doesn't;
   // nothing else in the viewer depends on it existing.
-  buildImagineLines(maxLines = 8, maxPoints = 24) {
-    if (this.imagineLines.length) return;
-    for (let i = 0; i < maxLines; i++) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(maxPoints * 3), 3));
-      geo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(maxPoints * 3), 3));
-      geo.setDrawRange(0, 0);
-      const mesh = new THREE.Line(geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 }));
+  //
+  // Dots, not a line: a thin line viewed nearly end-on (the chase camera looking
+  // straight down a mostly-forward imagined path is the common case) foreshortens
+  // toward invisibility -- a dot has volume in every direction, so it never does.
+  // It also reads as a visually distinct thing from the LIDAR ring right next to
+  // it, which was the other half of the point.
+  buildImagineDots(maxLines = 8, maxPoints = 24) {
+    if (this.imagineDots.length) return;
+    this.imagineDotGeo = new THREE.SphereGeometry(0.22, 8, 6);
+    this.imagineDotsPerLine = maxPoints;
+    for (let i = 0; i < maxLines * maxPoints; i++) {
+      const mesh = new THREE.Mesh(this.imagineDotGeo, new THREE.MeshBasicMaterial({
+        color: C.imagine, transparent: true, opacity: 0.85 }));
       mesh.visible = false;
+      mesh.frustumCulled = false;
       this.overlay.add(mesh);
-      this.imagineLines.push(mesh);
+      this.imagineDots.push(mesh);
     }
   }
 
-  // Each rollout fades from the brand-violet "imagine" colour (next step) toward a
-  // dim variant of it (the end of the horizon) -- the same near/far colour-lerp
-  // technique the LIDAR fan uses for range, repurposed here for "how far into an
-  // imagined future this point is" rather than "how dangerous". Colour, not alpha,
-  // fades: THREE's vertex colours don't carry alpha without a custom shader, and a
-  // uniform opacity that shrinks as more rollouts are shown keeps a many-sample
-  // imagination from reading as one solid, meaningless blob.
+  // Each rollout shrinks and fades from the brand-violet "imagine" colour (next
+  // step) toward a dim, smaller version of it (the end of the horizon) -- the
+  // same near/far colour-lerp technique the LIDAR dots use for range, repurposed
+  // here for "how far into an imagined future this point is" rather than "how
+  // dangerous". A per-line opacity that shrinks as more rollouts are shown keeps
+  // a many-sample imagination from reading as one solid, meaningless blob.
   updateImagination(view) {
-    const pool = this.imagineLines;
+    const pool = this.imagineDots, perLine = this.imagineDotsPerLine;
     if (!pool.length) return;
-    for (const l of pool) l.visible = false;
+    for (const dot of pool) dot.visible = false;
     if (!this.overlays) return;
     const trajs = (view.driver && view.driver.imagined_trajectories) || [];
     if (!trajs.length) return;
-    const opacity = clamp(0.9 / Math.sqrt(trajs.length), 0.25, 0.9);
+    const maxLines = Math.floor(pool.length / perLine);
+    const baseOpacity = clamp(0.9 / Math.sqrt(trajs.length), 0.3, 0.9);
     const nearC = new THREE.Color(C.imagine), farC = nearC.clone().multiplyScalar(0.35), c = new THREE.Color();
-    for (let i = 0; i < pool.length; i++) {
+    for (let i = 0; i < Math.min(trajs.length, maxLines); i++) {
       const traj = trajs[i];
       if (!traj || !traj.x || !traj.x.length) continue;
-      const line = pool[i], pos = line.geometry.attributes.position, col = line.geometry.attributes.color;
-      const n = Math.min(traj.x.length, pos.count);
+      const n = Math.min(traj.x.length, perLine);
       for (let k = 0; k < n; k++) {
-        pos.setXYZ(k, traj.x[k], 0.35, traj.y[k]);
-        c.copy(nearC).lerp(farC, n > 1 ? k / (n - 1) : 0);
-        col.setXYZ(k, c.r, c.g, c.b);
+        const t = n > 1 ? k / (n - 1) : 0;
+        const dot = pool[i * perLine + k];
+        dot.position.set(traj.x[k], 0.3, traj.y[k]);
+        c.copy(nearC).lerp(farC, t);
+        dot.material.color.copy(c);
+        dot.material.opacity = baseOpacity * (1 - 0.5 * t);
+        dot.scale.setScalar(1 - 0.45 * t);
+        dot.visible = true;
       }
-      pos.needsUpdate = col.needsUpdate = true;
-      line.geometry.setDrawRange(0, n);
-      line.material.opacity = opacity;
-      line.visible = true;
     }
   }
 
@@ -642,13 +648,26 @@ export class Scene {
     }
   }
 
+  // A ring of proximity dots, one per beam, at the beam's actual hit point --
+  // not the full ray back to the car. A 32-line starburst from the car reads
+  // as visual noise once the scene also has to show imagined-future dots
+  // (see updateImagination); a ring of dots around the car is a different
+  // enough shape and position (surrounding the car vs trailing ahead of it)
+  // to stay legible next to it, while keeping the same near/far colour cue.
   buildLidar(m) {
-    if (this.lidar) { this.overlay.remove(this.lidar); this.lidar.geometry.dispose(); }
-    const n = m.cfg.n_beams, geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 6), 3));
-    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 6), 3));
-    this.lidar = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.75 }));
-    this.lidar.frustumCulled = false; this.overlay.add(this.lidar);
+    if (this.lidarDots.length) {
+      for (const d of this.lidarDots) { this.overlay.remove(d); d.material.dispose(); }
+      this.lidarDotGeo.dispose();
+    }
+    const n = m.cfg.n_beams;
+    this.lidarDotGeo = new THREE.SphereGeometry(0.18, 6, 5);
+    this.lidarDots = [];
+    for (let i = 0; i < n; i++) {
+      const dot = new THREE.Mesh(this.lidarDotGeo, new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.85 }));
+      dot.frustumCulled = false;
+      this.overlay.add(dot);
+      this.lidarDots.push(dot);
+    }
     this.lidarOffsets = m.lidar_offsets; this.lidarRange = m.cfg.lidar_range;
   }
 
@@ -680,17 +699,17 @@ export class Scene {
       mk.ring.material.opacity = cur ? 0.9 : 0.4; mk.beam.material.opacity = cur ? 0.25 : 0.08;
     });
 
-    // Overlays: LIDAR fan coloured by range, the driver's chosen heading (amber) and the goal bearing (teal).
+    // Overlays: LIDAR proximity dots coloured by range, the driver's chosen heading (amber) and the goal bearing (teal).
     this.overlay.visible = this.overlays;
-    if (this.overlays && this.lidar) {
-      const pos = this.lidar.geometry.attributes.position, col = this.lidar.geometry.attributes.color, c = new THREE.Color();
-      for (let k = 0; k < view.lidar.length; k++) {
-        const a = e.heading + this.lidarOffsets[k], d = view.lidar[k];
-        c.copy(C.near).lerp(C.far, clamp(d / this.lidarRange, 0, 1));
-        pos.setXYZ(2 * k, e.x, 0.5, e.y); pos.setXYZ(2 * k + 1, e.x + Math.cos(a) * d, 0.5, e.y + Math.sin(a) * d);
-        col.setXYZ(2 * k, c.r, c.g, c.b); col.setXYZ(2 * k + 1, c.r, c.g, c.b);
+    for (const dot of this.lidarDots) dot.visible = this.overlays;
+    if (this.overlays && this.lidarDots.length) {
+      const c = new THREE.Color();
+      for (let k = 0; k < view.lidar.length && k < this.lidarDots.length; k++) {
+        const a = e.heading + this.lidarOffsets[k], dist = view.lidar[k];
+        c.copy(C.near).lerp(C.far, clamp(dist / this.lidarRange, 0, 1));
+        this.lidarDots[k].position.set(e.x + Math.cos(a) * dist, 0.5, e.y + Math.sin(a) * dist);
+        this.lidarDots[k].material.color.copy(c);
       }
-      pos.needsUpdate = col.needsUpdate = true;
       const d = view.driver;
       if (d && !view.manual && typeof d.theta_deg === 'number') {
         const th = e.heading + d.theta_deg * Math.PI / 180, len = clamp(d.chosen_clear, 3, 28);
