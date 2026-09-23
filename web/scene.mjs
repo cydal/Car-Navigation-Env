@@ -219,7 +219,7 @@ export class Scene {
     }
 
     this.overlay = new THREE.Group(); this.scene.add(this.overlay);
-    this.lidarDots = []; this.lidarDotGeo = null; this.lidarOffsets = [];
+    this.lidarWave = null; this.waveClock = 0; this.lidarOffsets = [];
     const line = color => new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
     this.intentLine = line(C.ego); this.goalLine = line(0xff6ba8);
     this.overlay.add(this.intentLine, this.goalLine);
@@ -648,27 +648,60 @@ export class Scene {
     }
   }
 
-  // A ring of proximity dots, one per beam, at the beam's actual hit point --
-  // not the full ray back to the car. A 32-line starburst from the car reads
-  // as visual noise once the scene also has to show imagined-future dots
-  // (see updateImagination); a ring of dots around the car is a different
-  // enough shape and position (surrounding the car vs trailing ahead of it)
-  // to stay legible next to it, while keeping the same near/far colour cue.
+  // A sonar-style pulse: a ring band that breathes outward from the car to
+  // lidar_range and back, its radius at each angle clipped to that beam's
+  // actual measured distance -- so it isn't decoration, it visibly hugs and
+  // stops at whatever LIDAR actually reports in that direction, same near/far
+  // colour cue as before. One triangle-strip ring, rebuilt only when the beam
+  // count changes; `updateLidarWave` just rewrites its vertex positions/colours
+  // every frame from the current animation phase and the live scan.
   buildLidar(m) {
-    if (this.lidarDots.length) {
-      for (const d of this.lidarDots) { this.overlay.remove(d); d.material.dispose(); }
-      this.lidarDotGeo.dispose();
+    if (this.lidarWave) {
+      this.overlay.remove(this.lidarWave);
+      this.lidarWave.geometry.dispose(); this.lidarWave.material.dispose();
     }
-    const n = m.cfg.n_beams;
-    this.lidarDotGeo = new THREE.SphereGeometry(0.18, 6, 5);
-    this.lidarDots = [];
-    for (let i = 0; i < n; i++) {
-      const dot = new THREE.Mesh(this.lidarDotGeo, new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.85 }));
-      dot.frustumCulled = false;
-      this.overlay.add(dot);
-      this.lidarDots.push(dot);
+    const n = m.cfg.n_beams, geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 2 * 3), 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 2 * 3), 3));
+    const idx = [];
+    for (let k = 0; k < n; k++) {
+      const k1 = (k + 1) % n, a = 2 * k, b = 2 * k + 1, c = 2 * k1, d = 2 * k1 + 1;
+      idx.push(a, b, c,  c, b, d);
     }
+    geo.setIndex(idx);
+    this.lidarWave = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false }));
+    this.lidarWave.frustumCulled = false;
+    this.overlay.add(this.lidarWave);
     this.lidarOffsets = m.lidar_offsets; this.lidarRange = m.cfg.lidar_range;
+    this.waveClock = 0;
+  }
+
+  // Triangle wave 0->1->0, not a sawtooth: "outwards and back", not a sweep
+  // that snaps back to the start. `wavePeriod` is one full out-and-back cycle.
+  updateLidarWave(view, dt) {
+    const mesh = this.lidarWave;
+    if (!mesh) return;
+    mesh.visible = this.overlays;
+    if (!this.overlays) return;
+    const wavePeriod = 3.0, thickness = 1.4, minR = 1.0;
+    this.waveClock = (this.waveClock + dt) % wavePeriod;
+    const phase = this.waveClock / wavePeriod;
+    const tri = phase < 0.5 ? phase * 2 : (1 - phase) * 2;
+    const waveR = minR + tri * (this.lidarRange - minR);
+    const e = view.ego, n = Math.min(view.lidar.length, this.lidarOffsets.length);
+    const pos = mesh.geometry.attributes.position, col = mesh.geometry.attributes.color, c = new THREE.Color();
+    for (let k = 0; k < n; k++) {
+      const a = e.heading + this.lidarOffsets[k], beamD = view.lidar[k];
+      const rOuter = Math.min(waveR, beamD), rInner = Math.max(0.2, rOuter - thickness);
+      const ca = Math.cos(a), sa = Math.sin(a);
+      pos.setXYZ(2 * k, e.x + ca * rInner, 0.4, e.y + sa * rInner);
+      pos.setXYZ(2 * k + 1, e.x + ca * rOuter, 0.4, e.y + sa * rOuter);
+      c.copy(C.near).lerp(C.far, clamp(beamD / this.lidarRange, 0, 1));
+      col.setXYZ(2 * k, c.r, c.g, c.b); col.setXYZ(2 * k + 1, c.r, c.g, c.b);
+    }
+    pos.needsUpdate = col.needsUpdate = true;
+    mesh.material.opacity = 0.3 + 0.4 * tri;
   }
 
   // ------------------------------------------------------------------ per frame
@@ -699,17 +732,10 @@ export class Scene {
       mk.ring.material.opacity = cur ? 0.9 : 0.4; mk.beam.material.opacity = cur ? 0.25 : 0.08;
     });
 
-    // Overlays: LIDAR proximity dots coloured by range, the driver's chosen heading (amber) and the goal bearing (teal).
+    // Overlays: a pulsing LIDAR wave coloured by range, the driver's chosen heading (amber) and the goal bearing (teal).
     this.overlay.visible = this.overlays;
-    for (const dot of this.lidarDots) dot.visible = this.overlays;
-    if (this.overlays && this.lidarDots.length) {
-      const c = new THREE.Color();
-      for (let k = 0; k < view.lidar.length && k < this.lidarDots.length; k++) {
-        const a = e.heading + this.lidarOffsets[k], dist = view.lidar[k];
-        c.copy(C.near).lerp(C.far, clamp(dist / this.lidarRange, 0, 1));
-        this.lidarDots[k].position.set(e.x + Math.cos(a) * dist, 0.5, e.y + Math.sin(a) * dist);
-        this.lidarDots[k].material.color.copy(c);
-      }
+    this.updateLidarWave(view, dt);
+    if (this.overlays) {
       const d = view.driver;
       if (d && !view.manual && typeof d.theta_deg === 'number') {
         const th = e.heading + d.theta_deg * Math.PI / 180, len = clamp(d.chosen_clear, 3, 28);

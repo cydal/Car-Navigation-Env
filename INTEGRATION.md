@@ -798,8 +798,8 @@ Point `main.py serve` at it (`--agent configs/dreamer.json`, the same JSON-
 config mechanism every custom agent uses) and the rollouts show up
 immediately: a trail of small violet dots ahead of the car, shrinking and
 fading toward the end of the horizon (dots rather than a line so it stays
-legible viewed nearly end-on, and reads as distinct from the LIDAR dots
-around the car), plus an `imagining ×N · H steps` chip next to the agent's
+legible viewed nearly end-on, and reads as distinct from the pulsing LIDAR
+wave around the car), plus an `imagining ×N · H steps` chip next to the agent's
 name in the driver panel — both gated behind the existing `sensors` overlay
 toggle, so turning overlays off hides them along with LIDAR and detection
 boxes. No server-side code has to change for a new
